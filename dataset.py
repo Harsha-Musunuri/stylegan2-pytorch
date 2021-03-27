@@ -97,6 +97,43 @@ class MultiResolutionDataset(Dataset):
 
         return img
 
+class CifarLmdbDataset(Dataset):
+    def __init__(self, path, transform, resolution=256):
+        self.env = lmdb.open(
+            path,
+            max_readers=32,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+        )
+
+        if not self.env:
+            raise IOError('Cannot open lmdb dataset', path)
+
+        with self.env.begin(write=False) as txn:
+            self.length = int(txn.get('length'.encode('utf-8')).decode('utf-8'))
+
+        self.resolution = resolution
+        self.transform = transform
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        with self.env.begin(write=False) as txn:
+            key = f'{self.resolution}-{str(index).zfill(5)}'.encode('utf-8')
+            img_bytes = txn.get(key)
+            print("hey",type(img_bytes))
+            img_bytes=pickle.loads(img_bytes)
+            print("hey",type(img_bytes))
+        label=img_bytes[1]
+        buffer = BytesIO(img_bytes[0])
+        img = Image.open(buffer)
+        img = self.transform(img)
+
+        return img,label
+
 
 class VideoFolderDataset(Dataset):
     def __init__(
