@@ -35,11 +35,8 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
-<<<<<<< HEAD
 
-=======
 from op import conv2d_gradfix
->>>>>>> upstream/master
 from non_leaking import augment, AdaptiveAugment
 
 
@@ -81,19 +78,19 @@ def d_logistic_loss(real_pred, fake_pred):
     return real_loss.mean() + fake_loss.mean()
 
 
-<<<<<<< HEAD
-def d_r1_loss(real_pred, real_img, args):
-    if args.convdFix:
-        # print("I entered")
-        with conv2d_gradfix.no_weight_gradients():
-            grad_real, = autograd.grad(
-                outputs=real_pred.sum(), inputs=real_img, create_graph=True
-            )
-    else:
-=======
+
+# def d_r1_loss(real_pred, real_img, args):
+#     if args.convdFix:
+#         # print("I entered")
+#         with conv2d_gradfix.no_weight_gradients():
+#             grad_real, = autograd.grad(
+#                 outputs=real_pred.sum(), inputs=real_img, create_graph=True
+#             )
+#     else:
+
 def d_r1_loss(real_pred, real_img):
     with conv2d_gradfix.no_weight_gradients():
->>>>>>> upstream/master
+
         grad_real, = autograd.grad(
             outputs=real_pred.sum(), inputs=real_img, create_graph=True
         )
@@ -468,11 +465,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
     parser.add_argument("--path", type=str, help="path to the lmdb dataset")
-<<<<<<< HEAD
+
     parser.add_argument("--convdFix", action='store_true', help="should I use ConvdFix")  # args for when to eval ?
-=======
+
     parser.add_argument("--arch", type=str, default='stylegan2', help="model architectures (stylegan2 | swagan)")
->>>>>>> upstream/master
+
     parser.add_argument("--dataset", type=str, default='imagefolder')
     parser.add_argument("--cache", type=str, default='local.db')
     parser.add_argument("--name", type=str, help="experiment name", default='default_exp')

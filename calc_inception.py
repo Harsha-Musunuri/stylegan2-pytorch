@@ -12,6 +12,8 @@ import numpy as np
 from tqdm import tqdm
 from PIL import Image
 
+from utils_bigGAN import *
+from inceptionBigGan import inceptionBigGAN_v3
 from inception import InceptionV3
 from dataset import MultiResolutionDataset, VideoFolderDataset, get_image_dataset
 
@@ -106,12 +108,13 @@ if __name__ == "__main__":
     parser.add_argument("--cache", type=str, default=None)
     # parser.add_argument("path", metavar="PATH", help="path to datset lmdb file")
     parser.add_argument("--path", type=str, default=None,help='path to dataset')
-
+    parser.add_argument("--inceptionCkpt", type=str, default=None, help='path to inception checkpoint')
+    parser.add_argument("--prints", action='store_true', help="shoud I print debug lines")
+    parser.add_argument("--use_torch", action='store_true', help="shoud I use torch for FID calc")
 
     args = parser.parse_args()
 
-    inception = load_patched_inception_v3()
-    inception = nn.DataParallel(inception).eval().to(device)
+
 
     dset = None
     if args.dataset == 'multires':
@@ -144,22 +147,50 @@ if __name__ == "__main__":
             ]
         )
         dset = datasets.ImageFolder(args.path, transform=transform)
+    elif args.dataset == 'vggface': #for VGGFaces
+        dset = get_vggfaces_data( size=args.size,data_root=args.path)
     else:
         dset = get_image_dataset(args, args.dataset, args.path, train=args.eval_type=='train')
 
     # args.n_sample = min(args.n_sample, len(dset))
     indices = torch.randperm(len(dset))[:args.n_sample]
     dset = Subset(dset, indices)
+    print("length of dataset: ",len(dset),"\n")
     loader = DataLoader(dset, batch_size=args.batch, num_workers=4, shuffle=True)
 
-    features = extract_features(loader, inception, device).numpy()
 
-    # features = features[: args.n_sample]
+    if args.dataset=='vggface':
+        print("loading inception model \n")
+        inception_model = inceptionBigGAN_v3(num_classes=2000,init_weights=False,pretrained=False, transform_input=False)
+        inception_model.load_state_dict(
+            torch.load(args.inceptionCkpt))
+        inception_model = WrapInception(inception_model.eval()).cuda()
+        inception_model = nn.DataParallel(inception_model)
+        print("inception model loaded without issues \n")
+        sample = sample_data(loader)
+        pool, logits, labels = accumulate_inception_activations(sample, inception_model,
+                                                                num_inception_images=args.n_sample)
 
-    print(f"extracted {features.shape[0]} features")
+        if args.prints:
+            print('Calculating means and covariances...')
+        if args.use_torch:
+            mean, cov = torch.mean(pool, 0), torch_cov(pool, rowvar=False)
+        else:
+            mean, cov = np.mean(pool.cpu().numpy(), axis=0), np.cov(pool.cpu().numpy(), rowvar=False)
+        if args.prints:
+            print('Covariances calculated\n')
+            print(f"extracted {pool.shape[0]} features")
+    else:
+        inception = load_patched_inception_v3()
+        inception = nn.DataParallel(inception).eval().to(device)
+        features = extract_features(loader, inception, device).numpy()
 
-    mean = np.mean(features, 0)
-    cov = np.cov(features, rowvar=False)
+        # features = features[: args.n_sample]
+
+        print(f"extracted {features.shape[0]} features")
+
+        mean = np.mean(features, 0)
+        cov = np.cov(features, rowvar=False)
 
     name = args.name or os.path.splitext(os.path.basename(args.path))[0]
 
