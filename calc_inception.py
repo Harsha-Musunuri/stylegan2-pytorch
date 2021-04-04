@@ -104,7 +104,9 @@ if __name__ == "__main__":
     parser.add_argument("--name", type=str, default=None, help="name of inception embedding file")
     parser.add_argument("--dataset", type=str, default='multires')
     parser.add_argument("--cache", type=str, default=None)
-    parser.add_argument("path", metavar="PATH", help="path to datset lmdb file")
+    # parser.add_argument("path", metavar="PATH", help="path to datset lmdb file")
+    parser.add_argument("--path", type=str, default=None,help='path to dataset')
+
 
     args = parser.parse_args()
 

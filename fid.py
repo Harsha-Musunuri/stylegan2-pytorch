@@ -25,7 +25,7 @@ def extract_feature_from_samples(
     features = []
     cnt = 0
     pbar = tqdm(batch_sizes) if verbose else batch_sizes
-    for batch in pbar:
+    for batch in tqdm(pbar):
         if samples is not None:
             img = samples[cnt:cnt+batch,...]
             cnt += batch

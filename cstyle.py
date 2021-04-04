@@ -728,6 +728,7 @@ class Discriminator(nn.Module):
             self.embed_dim = channels[4]
         elif self.which_phi == 'lin':
             self.embed_dim = channels[4]
+
         if embed_is_linear:
             self.embedding = EqualLinear(
                 self.embed_dim, n_classes, activation="fused_lrelu"

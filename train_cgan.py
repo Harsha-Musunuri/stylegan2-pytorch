@@ -4,6 +4,7 @@ import random
 import os
 
 import numpy as np
+import conv2d_gradfix
 import torch
 from torch import nn, autograd, optim
 from torch.nn import functional as F
@@ -17,6 +18,7 @@ from calc_inception import load_patched_inception_v3
 from fid import extract_feature_from_samples, calc_fid
 import pickle
 import pdb
+
 st = pdb.set_trace
 
 try:
@@ -34,6 +36,7 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
+
 from non_leaking import augment, AdaptiveAugment
 
 
@@ -76,9 +79,8 @@ def d_logistic_loss(real_pred, fake_pred):
 
 
 def d_r1_loss(real_pred, real_img, args):
-    if args.useConvdFix==True:
+    if args.convdFix:
         # print("I entered")
-        from op import conv2d_gradfix
         with conv2d_gradfix.no_weight_gradients():
             grad_real, = autograd.grad(
                 outputs=real_pred.sum(), inputs=real_img, create_graph=True
@@ -142,21 +144,32 @@ def set_grad_none(model, targets):
 
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
-    inception = real_mean = real_cov = mean_latent = None
-    if args.eval_every > 0:
-        inception = nn.DataParallel(load_patched_inception_v3()).to(device)
-        inception.eval()
-        with open(args.inception, "rb") as f:
-            embeds = pickle.load(f)
-            real_mean = embeds["mean"]
-            real_cov = embeds["cov"]
-    if get_rank() == 0:
+    # inception = real_mean = real_cov = mean_latent = None
+    # if args.eval_every > 0:
+    #     inception = nn.DataParallel(load_patched_inception_v3()).to(device)
+    #     inception.eval()
+    #     with open(args.inception, "rb") as f:
+    #         embeds = pickle.load(f)
+    #         real_mean = embeds["mean"]
+    #         real_cov = embeds["cov"]
+    # if get_rank() == 0:
+    #     if args.eval_every > 0:
+    #         with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
+    #             f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
+    #     if args.log_every > 0:
+    #         with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
+    #             f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
+
+    # inception related:
+    if (get_rank() == 0):
         if args.eval_every > 0:
+            inception = load_patched_inception_v3().to(device)
+            inception.eval()
             with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
-                f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
+                f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-' * 50}\n")
         if args.log_every > 0:
             with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
-                f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
+                f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-' * 50}\n")
 
     loader = sample_data(loader)
     pbar = range(args.iter)
@@ -249,7 +262,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             #     real_img_aug = real_img
             real_img_aug = real_img
             real_pred = discriminator(real_img_aug, real_labels)
-            r1_loss = d_r1_loss(real_pred, real_img)
+            r1_loss = d_r1_loss(real_pred, real_img, args)
 
             discriminator.zero_grad()
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
@@ -300,7 +313,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             g_optim.step()
 
             mean_path_length_avg = (
-                reduce_sum(mean_path_length).item() / get_world_size()
+                    reduce_sum(mean_path_length).item() / get_world_size()
             )
 
         loss_dict["path"] = path_loss
@@ -342,7 +355,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         "Path Length": path_length_val,
                     }
                 )
-            
+
             if i % args.log_every == 0:
                 with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
                     f.write(
@@ -358,8 +371,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 with torch.no_grad():
                     g_ema.eval()
                     for sheet_index in range(args.n_sheets):
-                        sample_z_sheet = sample_z[sheet_index*args.n_sample_per_sheet:(sheet_index+1)*args.n_sample_per_sheet]
-                        sample_y_sheet = sample_y[sheet_index*args.n_sample_per_sheet:(sheet_index+1)*args.n_sample_per_sheet]
+                        sample_z_sheet = sample_z[sheet_index * args.n_sample_per_sheet:(sheet_index + 1) * args.n_sample_per_sheet]
+                        sample_y_sheet = sample_y[sheet_index * args.n_sample_per_sheet:(sheet_index + 1) * args.n_sample_per_sheet]
                         sample, _ = g_ema([sample_z_sheet], sample_y_sheet)
                         utils.save_image(
                             sample,
@@ -368,22 +381,48 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                             normalize=True,
                             range=(-1, 1),
                         )
-            
+                        break
+
+            # if args.eval_every > 0 and i % args.eval_every == 0:
+            #     with torch.no_grad():
+            #         g_ema.eval()
+            #         if args.truncation < 1:
+            #             mean_latent = g_ema.mean_latent(4096)
+            #         features = extract_feature_from_samples(
+            #             g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device,
+            #             n_classes=args.n_classes,
+            #         ).numpy()
+            #         sample_mean = np.mean(features, 0)
+            #         sample_cov = np.cov(features, rowvar=False)
+            #         fid = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+            #     # print("fid:", fid)
+            #     with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
+            #         f.write(f"{i:07d}; fid: {float(fid):.4f};\n")
+
+            # inception related:
             if args.eval_every > 0 and i % args.eval_every == 0:
+                real_mean = real_cov = mean_latent = None
+                with open(args.inception, "rb") as f:
+                    embeds = pickle.load(f)
+                    real_mean = embeds["mean"]
+                    real_cov = embeds["cov"]
+                    # print("yahooo!\n")
                 with torch.no_grad():
                     g_ema.eval()
                     if args.truncation < 1:
                         mean_latent = g_ema.mean_latent(4096)
+                    # print("I am fine sir!\n")
                     features = extract_feature_from_samples(
                         g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device,
                         n_classes=args.n_classes,
                     ).numpy()
+                    # print("I am normal sir!")
                     sample_mean = np.mean(features, 0)
                     sample_cov = np.cov(features, rowvar=False)
                     fid = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                # print("fid:", fid)
-                with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
-                    f.write(f"{i:07d}; fid: {float(fid):.4f};\n")
+                    with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
+                        f.write(f"{i:07d}; fid: {float(fid):.4f};\n")
+                    # print("alright hurray \n")
 
             if i % args.save_every == 0:
                 torch.save(
@@ -399,7 +438,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     },
                     os.path.join(args.log_dir, 'weight', f"{str(i).zfill(6)}.pt"),
                 )
-            
+
             if i % args.save_latest_every == 0:
                 torch.save(
                     {
@@ -422,6 +461,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
     parser.add_argument("--path", type=str, help="path to the lmdb dataset")
+    parser.add_argument("--convdFix", action='store_true', help="should I use ConvdFix")  # args for when to eval ?
     parser.add_argument("--dataset", type=str, default='imagefolder')
     parser.add_argument("--cache", type=str, default='local.db')
     parser.add_argument("--name", type=str, help="experiment name", default='default_exp')
@@ -554,6 +594,7 @@ if __name__ == "__main__":
     args.flip = True
 
     args.start_iter = 0
+    # if get_rank()==0:
     util.set_log_dir(args)
     util.print_args(parser, args)
 
