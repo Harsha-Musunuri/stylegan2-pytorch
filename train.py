@@ -25,8 +25,7 @@ try:
 except ImportError:
     wandb = None
 
-from model import Generator, Discriminator
-from dataset import MultiResolutionDataset, VideoFolderDataset
+from dataset import get_image_dataset
 from distributed import (
     get_rank,
     synchronize,
@@ -34,6 +33,7 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
+from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
 
@@ -62,17 +62,13 @@ def accumulate(model1, model2, decay=0.999):
 
 
 def sample_data(loader):
-    # Endless iterator
+    # Endless image iterator
     while True:
         for batch in loader:
-            yield batch
-
-
-def sample_data2(loader):
-    # Endless iterator
-    while True:
-        for batch, _ in loader:
-            yield batch
+            if isinstance(batch, (list, tuple)):
+                yield batch[0]
+            else:
+                yield batch
 
 
 def d_logistic_loss(real_pred, fake_pred):
@@ -83,9 +79,10 @@ def d_logistic_loss(real_pred, fake_pred):
 
 
 def d_r1_loss(real_pred, real_img):
-    grad_real, = autograd.grad(
-        outputs=real_pred.sum(), inputs=real_img, create_graph=True
-    )
+    with conv2d_gradfix.no_weight_gradients():
+        grad_real, = autograd.grad(
+            outputs=real_pred.sum(), inputs=real_img, create_graph=True
+        )
     grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
 
     return grad_penalty
@@ -153,10 +150,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
                 f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
 
-    if args.dataset == 'imagefolder':
-        loader = sample_data2(loader)
-    else:
-        loader = sample_data(loader)
+    loader = sample_data(loader)
     pbar = range(args.iter)
     if get_rank() == 0:
         pbar = tqdm(pbar, initial=args.start_iter, dynamic_ncols=True, smoothing=0.01)
@@ -195,17 +189,12 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             break
 
-        # real_img = next(loader)
-        # real_img = real_img.to(device)
-        # real_imgs = [next(loader).to(device) for _ in range(args.n_step_d)]
-
         # Train Discriminator
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
         for step_index in range(args.n_step_d):
             real_img = next(loader).to(device)
-            # real_img = real_imgs[step_index]
 
             noise = mixing_noise(args.batch, args.latent, args.mixing, device)
             fake_img, _ = generator(noise)
@@ -237,11 +226,10 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if d_regularize:
             real_img.requires_grad = True
-            # if args.augment:
-            #     real_img_aug, _ = augment(real_img, ada_aug_p)
-            # else:
-            #     real_img_aug = real_img
-            real_img_aug = real_img
+            if args.augment:
+                real_img_aug, _ = augment(real_img, ada_aug_p)
+            else:
+                real_img_aug = real_img
             real_pred = discriminator(real_img_aug)
             r1_loss = d_r1_loss(real_pred, real_img)
 
@@ -411,6 +399,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
     parser.add_argument("--path", type=str, help="path to the lmdb dataset")
+    parser.add_argument("--arch", type=str, default='stylegan2', help="model architectures (stylegan2 | swagan)")
     parser.add_argument("--dataset", type=str, default='multires')
     parser.add_argument("--cache", type=str, default='local.db')
     parser.add_argument("--name", type=str, help="experiment name", default='default_exp')
@@ -515,6 +504,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_sample_fid", type=int, default=50000, help="number of the samples for calculating FID")
     parser.add_argument("--resume", action='store_true')
     parser.add_argument("--n_step_d", type=int, default=1)
+    parser.add_argument("--which_phi", type=str, default='vec')
 
     args = parser.parse_args()
     util.seed_everything()
@@ -535,11 +525,18 @@ if __name__ == "__main__":
     util.set_log_dir(args)
     util.print_args(parser, args)
 
+    if args.arch == 'stylegan2':
+        from model import Generator, Discriminator
+
+    elif args.arch == 'swagan':
+        from swagan import Generator, Discriminator
+
     generator = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
     ).to(device)
     discriminator = Discriminator(
-        args.size, channel_multiplier=args.channel_multiplier
+        args.size, channel_multiplier=args.channel_multiplier,
+        which_phi=args.which_phi,
     ).to(device)
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
@@ -599,43 +596,8 @@ if __name__ == "__main__":
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
-    dataset = None
-    if args.dataset == 'multires':
-        transform = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        dataset = MultiResolutionDataset(args.path, transform, args.size)
-    elif args.dataset == 'videofolder':
-        # [Note] Potentially, same transforms will be applied to a batch of images,
-        # either a sequence or a pair (optical flow), so we should apply ToTensor first.
-        transform = transforms.Compose(
-            [
-                # transforms.ToTensor(),  # this should be done in loader
-                transforms.RandomHorizontalFlip(),
-                transforms.Resize(args.size),  # Image.LANCZOS
-                transforms.CenterCrop(args.size),
-                # transforms.ToTensor(),  # normally placed here
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        dataset = VideoFolderDataset(args.path, transform, mode='image', cache=args.cache)
-        if len(dataset) == 0:
-            raise ValueError
-    elif args.dataset == 'imagefolder':
-        transform = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.Resize(args.size, Image.LANCZOS),
-                transforms.CenterCrop(args.size),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        dataset = datasets.ImageFolder(args.path, transform=transform)
+
+    dataset = get_image_dataset(args, args.dataset, args.path, train=True)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -645,5 +607,6 @@ if __name__ == "__main__":
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project=args.name)
+    util.print_models([generator, discriminator], args)
 
     train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)

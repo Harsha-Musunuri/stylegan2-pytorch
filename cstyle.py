@@ -8,9 +8,10 @@ from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Function
 
-from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d
+from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
 from models.stylegan_layers import EqualizedLinear
 import numpy as np
+import functools
 import pdb
 st = pdb.set_trace
 
@@ -115,7 +116,7 @@ class EqualConv2d(nn.Module):
             self.bias = None
 
     def forward(self, input):
-        out = F.conv2d(
+        out = conv2d_gradfix.conv2d(
             input,
             self.weight * self.scale,
             bias=self.bias,
@@ -157,9 +158,49 @@ class EqualLinear(nn.Module):
             out = fused_leaky_relu(out, self.bias * self.lr_mul)
 
         else:
+            bias = None if self.bias is None else self.bias * self.lr_mul
             out = F.linear(
-                input, self.weight * self.scale, bias=self.bias * self.lr_mul
+                input, self.weight * self.scale, bias=bias
             )
+
+        return out
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})"
+        )
+
+
+class ConditionalEqualLinear(nn.Module):
+    def __init__(
+        self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None,
+        embed_dim=512,
+    ):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
+
+        if bias:
+            self.bias = nn.Parameter(torch.randn(out_dim, embed_dim).div_(lr_mul))
+
+        else:
+            self.bias = None
+
+        self.activation = activation
+
+        self.scale_w = (1 / math.sqrt(in_dim)) * lr_mul
+        self.scale_b = (1 / math.sqrt(embed_dim)) * lr_mul
+        self.lr_mul = lr_mul
+
+    def forward(self, input, labels):
+        out = F.linear(input, self.weight * self.scale_w, bias=None)
+
+        if self.bias is not None:
+            bias = F.linear(labels, self.bias * self.scale_b, bias=None)
+            out = out + bias * self.lr_mul
+
+        if self.activation:
+            out = fused_leaky_relu(out, bias=None)
 
         return out
 
@@ -180,6 +221,8 @@ class ModulatedConv2d(nn.Module):
         upsample=False,
         downsample=False,
         blur_kernel=[1, 3, 3, 1],
+        fused=True,
+        conditional_bias=False,
     ):
         super().__init__()
 
@@ -189,6 +232,7 @@ class ModulatedConv2d(nn.Module):
         self.out_channel = out_channel
         self.upsample = upsample
         self.downsample = downsample
+        self.conditional_bias = conditional_bias
 
         if upsample:
             factor = 2
@@ -214,9 +258,13 @@ class ModulatedConv2d(nn.Module):
             torch.randn(1, out_channel, in_channel, kernel_size, kernel_size)
         )
 
-        self.modulation = EqualLinear(style_dim, in_channel, bias_init=1)
+        if self.conditional_bias:
+            self.modulation = ConditionalEqualLinear(style_dim, in_channel, True, embed_dim=style_dim)
+        else:
+            self.modulation = EqualLinear(style_dim, in_channel, bias_init=1)
 
         self.demodulate = demodulate
+        self.fused = fused
 
     def __repr__(self):
         return (
@@ -224,10 +272,45 @@ class ModulatedConv2d(nn.Module):
             f"upsample={self.upsample}, downsample={self.downsample})"
         )
 
-    def forward(self, input, style):
+    def forward(self, input, style, labels=None):
         batch, in_channel, height, width = input.shape
 
-        style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
+        if not self.fused:
+            weight = self.scale * self.weight.squeeze(0)
+            if self.conditional_bias:
+                style = self.modulation(style, labels)
+            else:
+                style = self.modulation(style)
+
+            if self.demodulate:
+                w = weight.unsqueeze(0) * style.view(batch, 1, in_channel, 1, 1)
+                dcoefs = (w.square().sum((2, 3, 4)) + 1e-8).rsqrt()
+
+            input = input * style.reshape(batch, in_channel, 1, 1)
+
+            if self.upsample:
+                weight = weight.transpose(0, 1)
+                out = conv2d_gradfix.conv_transpose2d(
+                    input, weight, padding=0, stride=2
+                )
+                out = self.blur(out)
+
+            elif self.downsample:
+                input = self.blur(input)
+                out = conv2d_gradfix.conv2d(input, weight, padding=0, stride=2)
+
+            else:
+                out = conv2d_gradfix.conv2d(input, weight, padding=self.padding)
+
+            if self.demodulate:
+                out = out * dcoefs.view(batch, -1, 1, 1)
+
+            return out
+
+        if self.conditional_bias:
+            style = self.modulation(style, labels).view(batch, 1, in_channel, 1, 1)
+        else:
+            style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
         weight = self.scale * self.weight * style
 
         if self.demodulate:
@@ -246,7 +329,9 @@ class ModulatedConv2d(nn.Module):
             weight = weight.transpose(1, 2).reshape(
                 batch * in_channel, self.out_channel, self.kernel_size, self.kernel_size
             )
-            out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
+            out = conv2d_gradfix.conv_transpose2d(
+                input, weight, padding=0, stride=2, groups=batch
+            )
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
             out = self.blur(out)
@@ -255,13 +340,17 @@ class ModulatedConv2d(nn.Module):
             input = self.blur(input)
             _, _, height, width = input.shape
             input = input.view(1, batch * in_channel, height, width)
-            out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
+            out = conv2d_gradfix.conv2d(
+                input, weight, padding=0, stride=2, groups=batch
+            )
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
 
         else:
             input = input.view(1, batch * in_channel, height, width)
-            out = F.conv2d(input, weight, padding=self.padding, groups=batch)
+            out = conv2d_gradfix.conv2d(
+                input, weight, padding=self.padding, groups=batch
+            )
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
 
@@ -288,11 +377,28 @@ class ConstantInput(nn.Module):
 
         self.input = nn.Parameter(torch.randn(1, channel, size, size))
 
-    def forward(self, input):
+    def forward(self, input, labels=None):
         batch = input.shape[0]
         out = self.input.repeat(batch, 1, 1, 1)
 
         return out
+
+
+class ConditionalInput(nn.Module):
+    def __init__(self, channel, size=4, lr_mlp=0.01, embed_dim=512):
+        super().__init__()
+
+        self.channel = channel
+        self.size = size
+        self.input = EqualLinear(
+            embed_dim, channel * size * size, lr_mul=lr_mlp,
+            # activation="fused_lrelu",
+        )
+
+    def forward(self, input, labels):
+        out = self.input(labels)
+
+        return out.reshape(-1, self.channel, self.size, self.size)
 
 
 class StyledConv(nn.Module):
@@ -305,6 +411,8 @@ class StyledConv(nn.Module):
         upsample=False,
         blur_kernel=[1, 3, 3, 1],
         demodulate=True,
+        fused_bias_linear=None,  # fused_bias(embed) -> out_channel
+        conditional_bias=False,  # conditional bias in modulation
     ):
         super().__init__()
 
@@ -316,17 +424,27 @@ class StyledConv(nn.Module):
             upsample=upsample,
             blur_kernel=blur_kernel,
             demodulate=demodulate,
+            conditional_bias=conditional_bias,
         )
 
         self.noise = NoiseInjection()
         # self.bias = nn.Parameter(torch.zeros(1, out_channel, 1, 1))
         # self.activate = ScaledLeakyReLU(0.2)
-        self.activate = FusedLeakyReLU(out_channel)
+        self.conditional_fused = fused_bias_linear is not None
+        if self.conditional_fused:
+            self.bias = fused_bias_linear(out_dim=out_channel)
+            self.activate = FusedLeakyReLU(out_channel, bias=False)
+        else:
+            self.activate = FusedLeakyReLU(out_channel)
 
-    def forward(self, input, style, noise=None):
-        out = self.conv(input, style)
+    def forward(self, input, style, noise=None, labels=None):
+        out = self.conv(input, style, labels)
         out = self.noise(out, noise=noise)
         # out = out + self.bias
+        if self.conditional_fused:
+            bias = self.bias(labels)
+            rest_dim = [1] * (out.ndim - bias.ndim)
+            out = out + bias.view(bias.shape[0], bias.shape[1], *rest_dim)
         out = self.activate(out)
 
         return out
@@ -354,6 +472,17 @@ class ToRGB(nn.Module):
         return out
 
 
+class OneHot(nn.Module):
+    def __init__(self, n_classes=10):
+        super(OneHot, self).__init__()
+        self.n_classes = n_classes
+
+    def forward(self, labels):
+        device = labels.device
+        labels = F.one_hot(labels, num_classes=self.n_classes).float().to(device)
+        return labels
+
+
 class Generator(nn.Module):
     def __init__(
         self,
@@ -366,6 +495,13 @@ class Generator(nn.Module):
         n_classes=10,
         conditional_strategy='ProjGAN',
         embed_is_linear=False,
+        add_pixel_norm=False,
+        conditional_style_in=True,    # [z, y] --> w
+        conditional_style_out=False,  # w + y --> w
+        conditional_input=False,      # input(y)
+        conditional_fused=False,      # bias(y) in fused leaky relu
+        conditional_bias=False,       # style bias is conditional
+        conditional_noise=False,      # make B conditional (channelwise)
     ):
         super().__init__()
 
@@ -373,25 +509,49 @@ class Generator(nn.Module):
         self.style_dim = style_dim
         self.n_classes = n_classes
         self.conditional_strategy = conditional_strategy
+        self.add_pixel_norm = add_pixel_norm
         self.embed_is_linear = embed_is_linear
+        self.conditional_style_in = conditional_style_in
+        self.conditional_style_out = conditional_style_out
+        self.conditional_input = conditional_input
+        self.conditional_fused = conditional_fused
 
         # Conditional embedding
+        lr_emb = 1.
+        bias_emb = True
+        self.embed_dim = style_dim
         if embed_is_linear:
-            self.embedding = EqualLinear(
-                n_classes, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
+            self.shared = nn.Sequential(
+                OneHot(n_classes),
+                EqualLinear(
+                    n_classes, style_dim, lr_mul=lr_emb,
+                    bias=bias_emb, activation=None,
+                ),
+            )
+            
+        else:
+            self.shared = nn.Embedding(n_classes, style_dim)
+        
+        if self.conditional_fused:
+            bias_linear = functools.partial(
+                EqualLinear,
+                in_dim=self.embed_dim,
+                bias=False,
+                lr_mul=lr_emb,
+                activation=None,
             )
         else:
-            self.embedding = nn.Embedding(n_classes, style_dim)
+            bias_linear = None
+        
         self.pixel_norm = PixelNorm()
 
-        # layers = [PixelNorm()]  # Normalize concated [z, embed_y] would be too strong?
-        layers = [
-            EqualLinear(
-                style_dim * 2, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
-            ),
-        ]
+        if self.conditional_style_in:
+            layers = [EqualLinear(style_dim + self.embed_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu")]
+            n_mlp -= 1
+        else:
+            layers = [PixelNorm()]
 
-        for i in range(n_mlp-1):
+        for i in range(n_mlp):
             layers.append(
                 EqualLinear(
                     style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
@@ -412,9 +572,13 @@ class Generator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        self.input = ConstantInput(self.channels[4])
+        if self.conditional_input:
+            self.input = ConditionalInput(self.channels[4], 4, lr_mlp, self.embed_dim)
+        else:
+            self.input = ConstantInput(self.channels[4])
         self.conv1 = StyledConv(
-            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
+            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel,
+            fused_bias_linear=bias_linear, conditional_bias=conditional_bias,
         )
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
 
@@ -444,12 +608,16 @@ class Generator(nn.Module):
                     style_dim,
                     upsample=True,
                     blur_kernel=blur_kernel,
+                    fused_bias_linear=bias_linear,
+                    conditional_bias=conditional_bias,
                 )
             )
 
             self.convs.append(
                 StyledConv(
-                    out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel
+                    out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel,
+                    fused_bias_linear=bias_linear,
+                    conditional_bias=conditional_bias
                 )
             )
 
@@ -477,67 +645,6 @@ class Generator(nn.Module):
         latent = self.style(latent_in).mean(0, keepdim=True)
 
         return latent
-    
-    def get_label_embedding(self, labels):
-        device = labels.device
-        if self.embed_is_linear:
-            labels = F.one_hot(labels, num_classes=self.n_classes).float().to(device)
-            return self.embedding(labels)
-        else:
-            return self.embedding(labels)
-
-    # def get_latent(self, input):
-    #     shape = input.shape
-    #     if shape[-1] > self.style_dim:
-    #         style = self.style(input.view(-1, self.style_dim))
-    #         style = style.view(*shape)
-    #     else:
-    #         style = self.style(input)
-    #     return style
-    
-    def get_styles(
-        self,
-        styles,
-        labels=None,
-        inject_index=None,
-        truncation=1,
-        truncation_latent=None,
-        input_is_latent=False,
-        noise=None,
-        randomize_noise=True,
-    ):
-        if not input_is_latent:
-            styles = [self.pixel_norm(s) for s in styles]
-            labels = self.get_label_embedding(labels)
-            labels = self.pixel_norm(labels)
-            styles = [torch.cat([s, labels], dim=1) for s in styles]
-            styles = [self.style(s) for s in styles]
-        if noise is None:
-            if randomize_noise:
-                noise = [None] * self.num_layers
-            else:
-                noise = [getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)]
-        if truncation < 1:
-            style_t = []
-            for style in styles:
-                style_t.append(truncation_latent + truncation * (style - truncation_latent))
-            styles = style_t
-        if len(styles) < 2:  # no mixing
-            inject_index = self.n_latent
-            if styles[0].ndim < 3:  # w is of dim [batch, 512], repeat at dim 1 for each block
-                if styles[0].shape[1] == self.style_dim:
-                    latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
-                else:
-                    latent = styles[0].view(styles[0].shape[0], -1, self.style_dim)
-            else:  # w is of dim [batch, n_latent, 512]
-                latent = styles[0]
-        else:  # mixing
-            if inject_index is None:
-                inject_index = random.randint(1, self.n_latent - 1)
-            latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
-            latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
-            latent = torch.cat([latent, latent2], 1)
-        return latent
 
     def forward(
         self,
@@ -550,12 +657,18 @@ class Generator(nn.Module):
         input_is_latent=False,
         noise=None,
         randomize_noise=True,
+        label_is_embeding=False,
     ):
-        if not input_is_latent:  # if `style' is z, then get w = self.style(z)
-            styles = [self.pixel_norm(s) for s in styles]
-            labels = self.get_label_embedding(labels)
+        if not label_is_embeding:
+            labels = self.shared(labels)
+        if self.add_pixel_norm:
             labels = self.pixel_norm(labels)
-            styles = [torch.cat([s, labels], dim=1) for s in styles]
+
+        if not input_is_latent:
+            # styles is noise
+            if self.conditional_style_in:
+                styles = [self.pixel_norm(s) for s in styles]
+                styles = [torch.cat([s, labels], dim=1) for s in styles]
             styles = [self.style(s) for s in styles]
 
         if noise is None:
@@ -596,9 +709,12 @@ class Generator(nn.Module):
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
             latent = torch.cat([latent, latent2], 1)
+        
+        if self.conditional_style_out:
+            latent = latent + labels.unsqueeze(1).repeat(1, self.n_latent, 1)
 
-        out = self.input(latent)  # only batch_size of latent is used
-        out = self.conv1(out, latent[:, 0], noise=noise[0])
+        out = self.input(latent, labels)  # only batch_size of latent is used
+        out = self.conv1(out, latent[:, 0], noise=noise[0], labels=labels)
 
         skip = self.to_rgb1(out, latent[:, 1])
 
@@ -606,8 +722,8 @@ class Generator(nn.Module):
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
-            out = conv1(out, latent[:, i], noise=noise1)
-            out = conv2(out, latent[:, i + 1], noise=noise2)
+            out = conv1(out, latent[:, i], noise=noise1, labels=labels)
+            out = conv2(out, latent[:, i + 1], noise=noise2, labels=labels)
             skip = to_rgb(out, latent[:, i + 2], skip)
 
             i += 2
@@ -619,6 +735,24 @@ class Generator(nn.Module):
 
         else:
             return image, None
+
+
+class Identity(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(Identity, self).__init__()
+        # self.dummy = nn.Linear(1, 1, False)
+
+    def forward(self, input):
+        return input
+
+
+class Reshape(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(Reshape, self).__init__()
+        # self.dummy = nn.Linear(1, 1, False)
+
+    def forward(self, input):
+        return input.view(input.shape[0], -1)
 
 
 class ConvLayer(nn.Sequential):
@@ -667,22 +801,26 @@ class ConvLayer(nn.Sequential):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
+    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1], architecture='resnet'):
         super().__init__()
+
+        self.architecture = architecture
 
         self.conv1 = ConvLayer(in_channel, in_channel, 3)
         self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
 
-        self.skip = ConvLayer(
-            in_channel, out_channel, 1, downsample=True, activate=False, bias=False
-        )
+        if architecture == 'resnet':
+            self.skip = ConvLayer(
+                in_channel, out_channel, 1, downsample=True, activate=False, bias=False
+            )
 
     def forward(self, input):
         out = self.conv1(input)
         out = self.conv2(out)
 
-        skip = self.skip(input)
-        out = (out + skip) / math.sqrt(2)
+        if self.architecture == 'resnet':
+            skip = self.skip(input)
+            out = (out + skip) / math.sqrt(2)
 
         return out
 
@@ -695,9 +833,15 @@ class Discriminator(nn.Module):
         blur_kernel=[1, 3, 3, 1],
         in_channel=3,
         n_classes=10,
-        conditional_strategy='ProjGAN',
+        architecture='resnet',
+        conditional_strategy='InnerProd',
+        add_pixel_norm=False,
         embed_is_linear=False,
-        which_phi='vec',
+        which_phi='lin2',
+        which_cmap='embed',
+        embed_dim=None,
+        n_mlp=8,
+        lr_mlp=0.01,
     ):
         """
         which_phi == 'vec': phi(x) is vectorized feature before final_linear
@@ -718,23 +862,47 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
+        lr_emb = 1.
+        bias_emb = True
         self.n_classes = n_classes
+        self.architecture = architecture
         self.conditional_strategy = conditional_strategy
+        self.add_pixel_norm = add_pixel_norm
         self.embed_is_linear = embed_is_linear
+        self.which_cmap = which_cmap
         self.which_phi = which_phi
         if self.which_phi == 'vec':
             self.embed_dim = channels[4] * 4 * 4
-        elif self.which_phi == 'avg':
+        elif self.which_phi in ['avg1', 'avg2', 'lin1', 'lin2']:
             self.embed_dim = channels[4]
-        elif self.which_phi == 'lin':
-            self.embed_dim = channels[4]
+<<<<<<< HEAD
 
+=======
+        
+>>>>>>> upstream/master
         if embed_is_linear:
-            self.embedding = EqualLinear(
-                self.embed_dim, n_classes, activation="fused_lrelu"
+            self.shared = nn.Sequential(
+                OneHot(n_classes),
+                EqualLinear(
+                    n_classes, self.embed_dim, lr_mul=lr_emb,
+                    bias=bias_emb, activation=None,
+                ),
             )
         else:
-            self.embedding = nn.Embedding(n_classes, self.embed_dim)
+            self.shared = nn.Embedding(n_classes, self.embed_dim)
+        
+        if self.which_cmap == 'embed':
+            self.cmap = PixelNorm() if self.add_pixel_norm else Identity()
+        elif self.which_cmap == 'mlp':
+            layers = [PixelNorm()] if self.add_pixel_norm else []
+            for i in range(n_mlp):
+                layers.append(
+                    EqualLinear(
+                        self.embed_dim, self.embed_dim, lr_mul=lr_mlp, activation="fused_lrelu"
+                    )
+                )
+            self.cmap = nn.Sequential(*layers)
+
         self.pixel_norm = PixelNorm()
 
         convs = [ConvLayer(in_channel, channels[size], 1)]
@@ -746,7 +914,11 @@ class Discriminator(nn.Module):
         for i in range(log_size, 2, -1):
             out_channel = channels[2 ** (i - 1)]
 
-            convs.append(ResBlock(in_channel, out_channel, blur_kernel))
+            convs.append(
+                ResBlock(in_channel, out_channel, blur_kernel,
+                    architecture=architecture,
+                )
+            )
 
             in_channel = out_channel
 
@@ -756,18 +928,35 @@ class Discriminator(nn.Module):
         self.stddev_feat = 1
 
         self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)
+
+        # After final_conv -> block_phi + block_psi
         if self.which_phi == 'vec':
-            self.final_linear = nn.Sequential(
+            self.block_phi = Reshape()
+            self.block_psi = nn.Sequential(
                 EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
-                EqualLinear(channels[4], 1),
-            )  # final_linear is not linear
-        elif self.which_phi == 'avg':
-            self.final_linear = nn.Sequential(
+                EqualLinear(channels[4], 1))
+        elif self.which_phi == 'avg1':
+            self.block_phi = nn.AvgPool2d(4)  # squeeze is needed in forward
+            self.block_psi = EqualLinear(channels[4], 1)
+        elif self.which_phi == 'avg2':
+            self.block_phi = nn.AvgPool2d(4)  # squeeze is needed in forward
+            self.block_psi = nn.Sequential(
                 EqualLinear(channels[4], channels[4], activation="fused_lrelu"),
                 EqualLinear(channels[4], 1))
-        elif self.which_phi == 'lin':
-            self.final_linear0 = EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu")
-            self.final_linear = EqualLinear(channels[4], 1)
+        elif self.which_phi == 'lin1':
+            self.block_phi = nn.Sequential(
+                Reshape(),
+                EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"))
+            self.block_psi = EqualLinear(channels[4], 1)
+        elif self.which_phi == 'lin2':
+            self.block_phi = nn.Sequential(
+                Reshape(),
+                EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
+                EqualLinear(channels[4], channels[4]))
+            self.block_psi = EqualLinear(channels[4], 1)
+
+        if self.conditional_strategy == 'InnerProd':
+            self.block_psi = None
 
     def forward(self, input, labels=None):
         out = self.convs(input)
@@ -782,182 +971,14 @@ class Discriminator(nn.Module):
         stddev = stddev.repeat(group, 1, height, width)
         out = torch.cat([out, stddev], 1)
         out = self.final_conv(out)
-
-        if self.which_phi == 'vec':  # h = phi(x), dim is 8192
-            h = out.view(batch, -1)
-        elif self.which_phi == 'avg':  # h = phi(x), dim is 512
-            h = torch.sum(out, [2, 3]) / 16.
-        elif self.which_phi == 'lin':  # h = phi(x), dim is 512
-            h = self.final_linear0(out.view(batch, -1))
-
-        out = torch.squeeze(self.final_linear(h))
-        if self.embed_is_linear:
-            proj = self.embedding(h)[range(batch), labels]
-        else:
-            proj = torch.sum(torch.mul(self.embedding(labels), h), 1)
         
+        h = torch.squeeze(self.block_phi(out))  # h is phi(x)
+
+        proj = torch.sum(torch.mul(self.cmap(self.shared(labels)), h), 1)
+
+        if self.conditional_strategy == 'ProjGAN':
+            out = torch.squeeze(self.block_psi(h))
+        elif self.conditional_strategy == 'InnerProd':
+            out = 0.
+
         return proj + out
-
-
-class LinearResBlock(nn.Module):
-    def __init__(self, latent_dim=512, n_mlp=2, use_residual=True):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.use_residual = use_residual
-        layers = []
-        for i in range(n_mlp):
-            layers.append(
-                EqualLinear(
-                    latent_dim, latent_dim, lr_mul=0.01, activation="fused_lrelu"
-                )
-            )
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, input):
-        out = self.layers(input)
-        if self.use_residual:
-            return (input + out) / math.sqrt(2)
-        else:
-            return out
-
-
-class LatentMLP(nn.Module):
-    def __init__(self, latent_dim=512, n_mlp=8, use_residual=False, use_pixelnorm=False):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.use_residual = use_residual
-        n_layer_per_block = 2
-        if use_pixelnorm:
-            layers = [PixelNorm()]
-        else:
-            layers = []
-
-        for i in range(n_mlp//n_layer_per_block):
-            layers.append(
-                LinearResBlock(
-                    latent_dim, n_layer_per_block, use_residual
-                )
-            )
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, input):
-        shape = input.shape
-        if shape[-1] > self.latent_dim:
-            out = self.layers(input.view(-1, self.latent_dim))
-            out = out.view(*shape)
-        else:
-            out = self.layers(input)
-        return out
-
-
-class Identity(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.dummy = nn.Linear(1, 1, False)
-
-    def forward(self, input):
-        return input
-
-
-class Encoder(nn.Module):
-    def __init__(
-        self,
-        size,
-        style_dim=512,
-        channel_multiplier=2,
-        blur_kernel=[1, 3, 3, 1],
-        which_latent='w_plus',
-        reshape_latent=False,
-        stddev_group=4,
-        stddev_feat=1,
-        reparameterization=False,
-        return_tuple=True,  # backward compatibility
-    ):
-        """
-        which_latent: 'w_plus' predict different w for all blocks; 'w_shared' predict
-          a single w for all blocks; 'wb' predict w and b (bias) for all blocks;
-          'wb_shared' predict shared w and different biases.
-        """
-        super().__init__()
-
-        channels = {
-            4: 512,
-            8: 512,
-            16: 512,
-            32: 512,
-            64: 256 * channel_multiplier,
-            128: 128 * channel_multiplier,
-            256: 64 * channel_multiplier,
-            512: 32 * channel_multiplier,
-            1024: 16 * channel_multiplier,
-        }
-
-        convs = [ConvLayer(3, channels[size], 1)]
-
-        log_size = int(math.log(size, 2))
-        self.n_latent = log_size * 2 - 2  # copied from Generator
-        self.n_noises = (log_size - 2) * 2 + 1
-        self.which_latent = which_latent
-        self.reshape_latent = reshape_latent
-        self.style_dim = style_dim
-        self.reparameterization = reparameterization
-        self.return_tuple = return_tuple
-
-        in_channel = channels[size]
-
-        for i in range(log_size, 2, -1):
-            out_channel = channels[2 ** (i - 1)]
-
-            convs.append(ResBlock(in_channel, out_channel, blur_kernel))
-
-            in_channel = out_channel
-
-        self.convs = nn.Sequential(*convs)
-
-        self.stddev_group = stddev_group
-        self.stddev_feat = stddev_feat
-
-        self.final_conv = ConvLayer(in_channel + (self.stddev_group > 1), channels[4], 3)
-        if self.which_latent == 'w_plus':
-            out_channel = style_dim * self.n_latent
-        elif self.which_latent == 'w_shared':
-            out_channel = style_dim
-        else:
-            raise NotImplementedError
-        self.final_linear = nn.Sequential(
-            EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
-            EqualLinear(channels[4], out_channel),
-        )
-        if reparameterization:
-            self.final_logvar = nn.Sequential(
-            EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
-            EqualLinear(channels[4], out_channel),
-        )
-
-    def forward(self, input, reshape=False):
-        out = self.convs(input)
-        batch = out.shape[0]
-
-        if self.stddev_group > 1:
-            batch, channel, height, width = out.shape
-            group = min(batch, self.stddev_group)
-            stddev = out.view(
-                group, -1, self.stddev_feat, channel // self.stddev_feat, height, width
-            )
-            stddev = torch.sqrt(stddev.var(0, unbiased=False) + 1e-8)
-            stddev = stddev.mean([2, 3, 4], keepdims=True).squeeze(2)
-            stddev = stddev.repeat(group, 1, height, width)
-            out = torch.cat([out, stddev], 1)
-
-        out = self.final_conv(out)
-
-        out = out.view(batch, -1)
-        out_mean = self.final_linear(out)
-        if self.reparameterization:
-            out_logvar = self.final_logvar(out)
-            return out_mean, out_logvar
-        if self.which_latent == 'w_plus' and reshape:
-            out_mean = out_mean.reshape(batch, self.n_latent, self.style_dim)
-        if self.return_tuple:
-            return out_mean, None
-        return out_mean

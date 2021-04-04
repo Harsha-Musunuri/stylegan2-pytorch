@@ -27,8 +27,7 @@ try:
 except ImportError:
     wandb = None
 
-from cstyle import Generator, Discriminator
-from dataset import MultiResolutionDataset, get_image_dataset
+from dataset import get_image_dataset
 from distributed import (
     get_rank,
     synchronize,
@@ -36,7 +35,11 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
+<<<<<<< HEAD
 
+=======
+from op import conv2d_gradfix
+>>>>>>> upstream/master
 from non_leaking import augment, AdaptiveAugment
 
 
@@ -78,6 +81,7 @@ def d_logistic_loss(real_pred, fake_pred):
     return real_loss.mean() + fake_loss.mean()
 
 
+<<<<<<< HEAD
 def d_r1_loss(real_pred, real_img, args):
     if args.convdFix:
         # print("I entered")
@@ -86,6 +90,10 @@ def d_r1_loss(real_pred, real_img, args):
                 outputs=real_pred.sum(), inputs=real_img, create_graph=True
             )
     else:
+=======
+def d_r1_loss(real_pred, real_img):
+    with conv2d_gradfix.no_weight_gradients():
+>>>>>>> upstream/master
         grad_real, = autograd.grad(
             outputs=real_pred.sum(), inputs=real_img, create_graph=True
         )
@@ -256,11 +264,10 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if d_regularize:
             real_img.requires_grad = True
-            # if args.augment:
-            #     real_img_aug, _ = augment(real_img, ada_aug_p)
-            # else:
-            #     real_img_aug = real_img
-            real_img_aug = real_img
+            if args.augment:
+                real_img_aug, _ = augment(real_img, ada_aug_p)
+            else:
+                real_img_aug = real_img
             real_pred = discriminator(real_img_aug, real_labels)
             r1_loss = d_r1_loss(real_pred, real_img, args)
 
@@ -461,7 +468,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
     parser.add_argument("--path", type=str, help="path to the lmdb dataset")
+<<<<<<< HEAD
     parser.add_argument("--convdFix", action='store_true', help="should I use ConvdFix")  # args for when to eval ?
+=======
+    parser.add_argument("--arch", type=str, default='stylegan2', help="model architectures (stylegan2 | swagan)")
+>>>>>>> upstream/master
     parser.add_argument("--dataset", type=str, default='imagefolder')
     parser.add_argument("--cache", type=str, default='local.db')
     parser.add_argument("--name", type=str, help="experiment name", default='default_exp')
@@ -563,7 +574,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--flip", action="store_true", help="apply random flipping to real images"
     )
-    parser.add_argument("--conditional_strategy", type=str, default='ProjGAN')
+    parser.add_argument("--conditional_strategy", type=str, default='InnerProd')
     parser.add_argument("--n_classes", type=int, default=10)
     parser.add_argument("--n_sample_per_class", type=int, default=8, help="number of the samples per class")
     parser.add_argument("--n_class_per_sheet", type=int, default=8)
@@ -573,8 +584,19 @@ if __name__ == "__main__":
     parser.add_argument("--n_sample_fid", type=int, default=50000, help="number of the samples for calculating FID")
     parser.add_argument("--resume", action='store_true')
     parser.add_argument("--n_step_d", type=int, default=1)
+    parser.add_argument("--n_accum_d", type=int, default=1)
+    parser.add_argument("--n_accum_g", type=int, default=1)
     parser.add_argument("--embed_is_linear", action='store_true')
-    parser.add_argument("--which_phi", type=str, default='vec')
+    parser.add_argument("--which_phi", type=str, default='lin2')
+    parser.add_argument("--which_cmap", type=str, default='mlp')
+    parser.add_argument("--conditional_style_in", type=util.str2bool, default=True)
+    parser.add_argument("--conditional_style_out", type=util.str2bool, default=False)
+    parser.add_argument("--conditional_input", type=util.str2bool, default=False)
+    parser.add_argument("--conditional_fused", type=util.str2bool, default=False)
+    parser.add_argument("--conditional_bias", type=util.str2bool, default=False)
+    parser.add_argument("--conditional_noise", type=util.str2bool, default=False)
+    parser.add_argument("--arch_D", type=str, default='resnet', help="D architectures (resnet | orig)")
+    parser.add_argument("--add_pixel_norm", type=util.str2bool, default=False, help="use PixelNorm after mapping?")
 
     args = parser.parse_args()
     util.seed_everything()
@@ -598,24 +620,46 @@ if __name__ == "__main__":
     util.set_log_dir(args)
     util.print_args(parser, args)
 
+    if args.arch == 'stylegan2':
+        from cstyle import Generator, Discriminator
+    else:
+        raise NotImplementedError
+
     generator = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier,
         n_classes=args.n_classes,
         conditional_strategy=args.conditional_strategy,
+        add_pixel_norm=args.add_pixel_norm,
         embed_is_linear=args.embed_is_linear,
+        conditional_style_in=args.conditional_style_in,
+        conditional_style_out=args.conditional_style_out,
+        conditional_input=args.conditional_input,
+        conditional_fused=args.conditional_fused,
+        conditional_bias=args.conditional_bias,
+        conditional_noise=args.conditional_noise,
     ).to(device)
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier,
         n_classes=args.n_classes,
         conditional_strategy=args.conditional_strategy,
+        add_pixel_norm=args.add_pixel_norm,
         embed_is_linear=args.embed_is_linear,
         which_phi=args.which_phi,
+        which_cmap=args.which_cmap,
+        architecture=args.arch_D,
     ).to(device)
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier,
         n_classes=args.n_classes,
         conditional_strategy=args.conditional_strategy,
+        add_pixel_norm=args.add_pixel_norm,
         embed_is_linear=args.embed_is_linear,
+        conditional_style_in=args.conditional_style_in,
+        conditional_style_out=args.conditional_style_out,
+        conditional_input=args.conditional_input,
+        conditional_fused=args.conditional_fused,
+        conditional_bias=args.conditional_bias,
+        conditional_noise=args.conditional_noise,
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
@@ -672,6 +716,7 @@ if __name__ == "__main__":
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
+
     dataset = get_image_dataset(args, args.dataset, args.path, train=True)
     loader = data.DataLoader(
         dataset,
@@ -682,5 +727,6 @@ if __name__ == "__main__":
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project=args.name)
+    util.print_models([generator, discriminator], args)
 
     train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)

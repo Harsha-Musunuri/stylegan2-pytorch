@@ -87,6 +87,20 @@ def print_args(parser, args):
     shutil.copyfile(sys.argv[0], os.path.join(args.log_dir, f'{os.path.basename(sys.argv[0])}.txt'))
 
 
+def print_models(models, args):
+    if isinstance(models, (list, tuple)):
+        models = [models]
+    exp_dir = args.log_dir
+    if not os.path.exists(exp_dir):
+        os.makedirs(exp_dir)
+    file_name = os.path.join(exp_dir, 'models.txt')
+    with open(file_name, 'a+') as f:
+        f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
+        for model in models:
+            f.write(str(model))
+            f.write("\n\n")
+
+
 def str2list(attr_bins):
     assert (isinstance(attr_bins, str))
     attr_bins = attr_bins.strip()
@@ -97,6 +111,22 @@ def str2list(attr_bins):
         # attr_bins = np.array(ast.literal_eval(attr_bins))
         attr_bins = ast.literal_eval(attr_bins)
     return attr_bins
+
+
+def str2bool(v):
+    """
+    borrowed from:
+    https://stackoverflow.com/questions/715417/converting-from-a-string-to-boolean-in-python
+    :param v:
+    :return: bool(v)
+    """
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 def get_nframe_num(args):
     if args.nframe_num_range and args.nframe_iter_range:

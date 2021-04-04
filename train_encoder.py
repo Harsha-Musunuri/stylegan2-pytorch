@@ -25,9 +25,8 @@ try:
 except ImportError:
     wandb = None
 
-from model import Generator, Discriminator
 from idinvert_pytorch.models.perceptual_model import VGG16
-from dataset import MultiResolutionDataset, VideoFolderDataset
+from dataset import get_image_dataset
 from distributed import (
     get_rank,
     synchronize,
@@ -35,6 +34,7 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
+from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
 
@@ -63,10 +63,13 @@ def accumulate(model1, model2, decay=0.999):
 
 
 def sample_data(loader):
-    # Endless iterator
+    # Endless image iterator
     while True:
         for batch in loader:
-            yield batch
+            if isinstance(batch, (list, tuple)):
+                yield batch[0]
+            else:
+                yield batch
 
 
 def d_logistic_loss(real_pred, fake_pred):
@@ -77,9 +80,10 @@ def d_logistic_loss(real_pred, fake_pred):
 
 
 def d_r1_loss(real_pred, real_img):
-    grad_real, = autograd.grad(
-        outputs=real_pred.sum(), inputs=real_img, create_graph=True
-    )
+    with conv2d_gradfix.no_weight_gradients():
+        grad_real, = autograd.grad(
+            outputs=real_pred.sum(), inputs=real_img, create_graph=True
+        )
     grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
 
     return grad_penalty
@@ -465,6 +469,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StyleGAN2 encoder trainer")
 
     parser.add_argument("--path", type=str, help="path to the lmdb dataset")
+    parser.add_argument("--arch", type=str, default='stylegan2', help="model architectures (stylegan2 | swagan)")
     parser.add_argument("--dataset", type=str, default='multires')
     parser.add_argument("--cache", type=str, default='local.db')
     parser.add_argument("--sample_cache", type=str, default=None)
@@ -625,9 +630,14 @@ if __name__ == "__main__":
     args.n_mlp = 8
 
     args.start_iter = 0
-    # args.mixing = 0  # no mixing
     util.set_log_dir(args)
     util.print_args(parser, args)
+
+    if args.arch == 'stylegan2':
+        from model import Generator, Discriminator
+
+    elif args.arch == 'swagan':
+        from swagan import Generator, Discriminator
     
     # Auxiliary models (VGG and PWC)
     vggnet = VGG16(output_layer_idx=args.output_layer_idx).to(device)
@@ -745,43 +755,8 @@ if __name__ == "__main__":
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
-    dataset = None
-    if args.dataset == 'multires':
-        transform = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        dataset = MultiResolutionDataset(args.path, transform, args.size)
-    elif args.dataset == 'videofolder':
-        # [Note] Potentially, same transforms will be applied to a batch of images,
-        # either a sequence or a pair (optical flow), so we should apply ToTensor first.
-        transform = transforms.Compose(
-            [
-                # transforms.ToTensor(),  # this should be done in loader
-                transforms.RandomHorizontalFlip(),
-                transforms.Resize(args.size),  # Image.LANCZOS
-                transforms.CenterCrop(args.size),
-                # transforms.ToTensor(),  # normally placed here
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        dataset = VideoFolderDataset(args.path, transform, mode='image', cache=args.cache)
-        if len(dataset) == 0:
-            raise ValueError
-    elif args.dataset == 'imagefolder':
-        transform = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.Resize(args.size, Image.LANCZOS),
-                transforms.CenterCrop(args.size),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        dataset = datasets.ImageFolder(args.path, transform=transform)
+
+    dataset = get_image_dataset(args, args.dataset, args.path, train=True)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
