@@ -7,6 +7,8 @@ import shutil
 import random
 import numpy as np
 from torchvision.io import write_video
+from torchvision import utils
+from torch.nn import functional as F
 
 
 class AverageMeter(object):
@@ -79,7 +81,7 @@ def print_args(parser, args):
     with open(file_name, 'wt') as f:
         if os.getenv('CUDA_VISIBLE_DEVICES'):
             f.write('CUDA_VISIBLE_DEVICES=%s ' % os.getenv('CUDA_VISIBLE_DEVICES'))
-        f.write(' python ')
+        f.write('python ')
         f.write(' '.join(sys.argv))
         f.write('\n')
 
@@ -88,7 +90,7 @@ def print_args(parser, args):
 
 
 def print_models(models, args):
-    if isinstance(models, (list, tuple)):
+    if not isinstance(models, (list, tuple)):
         models = [models]
     exp_dir = args.log_dir
     if not os.path.exists(exp_dir):
@@ -141,6 +143,11 @@ def get_nframe_num(args):
     return nframe_num_list
 
 
+def save_image(ximg, path):
+    n_sample = ximg.shape[0]
+    utils.save_image(ximg, path, nrow=int(n_sample ** 0.5), normalize=True, range=(-1, 1))
+
+
 def save_video(xseq, path):
     video = xseq.data.cpu().clamp(-1, 1)
     video = ((video+1.)/2.*255).type(torch.uint8).permute(0, 2, 3, 1)
@@ -177,3 +184,39 @@ def estimate_optical_flow(netNetwork, tenFirst, tenSecond):
     tenFlow[:, 1, :, :] *= float(intHeight) / float(intPreprocessedHeight)
 
     return tenFlow[0, :, :, :]
+
+
+def randperm(n, ordered=False):
+    # ordered: include ordered permutation?
+    if ordered:
+        return torch.randperm(n)
+    else:
+        perm_ord = torch.tensor(range(n))
+        while True:
+            perm = torch.randperm(n)
+            if (perm != perm_ord).any():
+                return perm        
+
+
+def permute_dim(tensor, i=0, j=1, ordered=False):
+    # Permute along dim i for each j.
+    # e.g.: Factor-VAE, i = 0, j = 1; Jigsaw, i = 2, j = 0
+    device = tensor.device
+    n = tensor.shape[i]
+    return torch.cat([torch.index_select(t, i, randperm(n, ordered).to(device)) for t in tensor.split(1, j)], j)
+
+
+"""
+Negative Data Augmentations
+"""
+def negative_augment(img, nda_type='jigsaw_4'):
+    img_aug = None
+    if nda_type.startswith('jigsaw'):
+        n, c, h, w = img.shape
+        n_patch = int(nda_type.split('_')[1])  # number of patches
+        n_patch_sqrt = int(n_patch ** 0.5)
+        h_patch, w_patch = h//n_patch_sqrt, w//n_patch_sqrt
+        patches = F.unfold(img, kernel_size=(h_patch, w_patch), stride=(h_patch, w_patch))
+        patches_perm = permute_dim(patches, 2, 0)
+        img_aug = F.fold(patches_perm, (h, w), kernel_size=(h_patch, w_patch), stride=(h_patch, w_patch))
+    return img_aug, None

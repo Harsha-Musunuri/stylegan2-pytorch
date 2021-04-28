@@ -198,7 +198,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_module = generator
         d_module = discriminator
 
-    accum = 0.5 ** (32 / (10 * 1000))
+    # accum = 0.5 ** (32 / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
     r_t_stat = 0
 
@@ -323,6 +323,12 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
 
+        # Update G_ema
+        # G_ema = G * (1-ema_beta) + G_ema * ema_beta
+        ema_nimg = args.ema_kimg * 1000
+        if args.ema_rampup is not None:
+            ema_nimg = min(ema_nimg, i * args.batch * args.ema_rampup)
+        accum = 0.5 ** (args.batch / max(ema_nimg, 1e-8))
         accumulate(g_ema, g_module, accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
@@ -594,6 +600,11 @@ if __name__ == "__main__":
     parser.add_argument("--conditional_noise", type=util.str2bool, default=False)
     parser.add_argument("--arch_D", type=str, default='resnet', help="D architectures (resnet | orig)")
     parser.add_argument("--add_pixel_norm", type=util.str2bool, default=False, help="use PixelNorm after mapping?")
+    parser.add_argument("--stddev_group", type=int, default=4)
+    parser.add_argument("--n_mlp_g", type=int, default=8)
+    parser.add_argument("--n_mlp_d", type=int, default=8)
+    parser.add_argument("--ema_kimg", type=int, default=10, help="Half-life of the exponential moving average (EMA) of generator weights.")
+    parser.add_argument("--ema_rampup", type=float, default=None, help="EMA ramp-up coefficient.")
 
     args = parser.parse_args()
     util.seed_everything()
@@ -608,7 +619,6 @@ if __name__ == "__main__":
         synchronize()
 
     args.latent = 512
-    args.n_mlp = 8
     args.mixing = 0  # disable mixing
     args.flip = True
 
@@ -623,7 +633,7 @@ if __name__ == "__main__":
         raise NotImplementedError
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier,
+        args.size, args.latent, args.n_mlp_g, channel_multiplier=args.channel_multiplier,
         n_classes=args.n_classes,
         conditional_strategy=args.conditional_strategy,
         add_pixel_norm=args.add_pixel_norm,
@@ -637,6 +647,7 @@ if __name__ == "__main__":
     ).to(device)
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier,
+        stddev_group=args.stddev_group,
         n_classes=args.n_classes,
         conditional_strategy=args.conditional_strategy,
         add_pixel_norm=args.add_pixel_norm,
@@ -644,9 +655,10 @@ if __name__ == "__main__":
         which_phi=args.which_phi,
         which_cmap=args.which_cmap,
         architecture=args.arch_D,
+        n_mlp=args.n_mlp_d,
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier,
+        args.size, args.latent, args.n_mlp_g, channel_multiplier=args.channel_multiplier,
         n_classes=args.n_classes,
         conditional_strategy=args.conditional_strategy,
         add_pixel_norm=args.add_pixel_norm,

@@ -16,6 +16,7 @@ import util
 from calc_inception import load_patched_inception_v3
 from fid import extract_feature_from_samples, calc_fid
 import pickle
+from itertools import permutations
 import pdb
 st = pdb.set_trace
 
@@ -172,7 +173,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_module = generator
         d_module = discriminator
 
-    accum = 0.5 ** (32 / (10 * 1000))
+    # accum = 0.5 ** (32 / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
     r_t_stat = 0
 
@@ -192,6 +193,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         # Train Discriminator
         requires_grad(generator, False)
         requires_grad(discriminator, True)
+        if args.debug: util.seed_everything(i)
 
         for step_index in range(args.n_step_d):
             real_img = next(loader).to(device)
@@ -206,9 +208,23 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             else:
                 real_img_aug = real_img
 
-            fake_pred = discriminator(fake_img)
             real_pred = discriminator(real_img_aug)
-            d_loss = d_logistic_loss(real_pred, fake_pred)
+            fake_pred = discriminator(fake_img)
+            d_loss_real = F.softplus(-real_pred).mean()
+            d_loss_fake = F.softplus(fake_pred).mean()
+
+            d_loss_fake2 = 0
+            if args.lambda_nda < 1:
+                fake_img2, _ = util.negative_augment(real_img, args.nda_type)
+                if args.augment:
+                    fake_img2, _ = augment(fake_img2, ada_aug_p)
+                fake_pred2 = discriminator(fake_img2)
+                d_loss_fake2 = F.softplus(fake_pred2).mean()
+
+            d_loss = (
+                d_loss_real + 
+                d_loss_fake * args.lambda_nda + d_loss_fake2 * (1-args.lambda_nda)
+            )
 
             loss_dict["d"] = d_loss
             loss_dict["real_score"] = real_pred.mean()
@@ -222,7 +238,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             ada_aug_p = ada_augment.tune(real_pred)
             r_t_stat = ada_augment.r_t_stat
 
-        d_regularize = i % args.d_reg_every == 0
+        d_regularize = args.d_reg_every > 0 and i % args.d_reg_every == 0
 
         if d_regularize:
             real_img.requires_grad = True
@@ -243,7 +259,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         # Train Generator
         requires_grad(generator, True)
         requires_grad(discriminator, False)
-        # real_img = real_imgs[0]
+        if args.debug: util.seed_everything(i)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, _ = generator(noise)
@@ -287,6 +303,12 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
 
+        # Update G_ema
+        # G_ema = G * (1-ema_beta) + G_ema * ema_beta
+        ema_nimg = args.ema_kimg * 1000
+        if args.ema_rampup is not None:
+            ema_nimg = min(ema_nimg, i * args.batch * args.ema_rampup)
+        accum = 0.5 ** (args.batch / max(ema_nimg, 1e-8))
         accumulate(g_ema, g_module, accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
@@ -308,6 +330,28 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 )
             )
 
+            if i % args.log_every == 0:
+                with torch.no_grad():
+                    g_ema.eval()
+                    sample, _ = g_ema([sample_z])
+                    utils.save_image(
+                        sample,
+                        os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}.png"),
+                        nrow=int(args.n_sample ** 0.5),
+                        normalize=True,
+                        range=(-1, 1),
+                    )
+                with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
+                    f.write(
+                        (
+                            f"{i:07d}; "
+                            f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
+                            f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
+                            f"augment: {ada_aug_p:.4f}; "
+                            f"\n"
+                        )
+                    )
+            
             if wandb and args.wandb:
                 wandb.log(
                     {
@@ -324,29 +368,6 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
             
-            if i % args.log_every == 0:
-                with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
-                    f.write(
-                        (
-                            f"{i:07d}; "
-                            f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
-                            f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
-                            f"augment: {ada_aug_p:.4f};\n"
-                        )
-                    )
-
-            if i % args.log_every == 0:
-                with torch.no_grad():
-                    g_ema.eval()
-                    sample, _ = g_ema([sample_z])
-                    utils.save_image(
-                        sample,
-                        os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}.png"),
-                        nrow=int(args.n_sample ** 0.5),
-                        normalize=True,
-                        range=(-1, 1),
-                    )
-            
             if args.eval_every > 0 and i % args.eval_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
@@ -358,9 +379,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     sample_mean = np.mean(features, 0)
                     sample_cov = np.cov(features, rowvar=False)
                     fid = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                # print("fid:", fid)
                 with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
-                    f.write(f"{i:07d}; fid: {float(fid):.4f};\n")
+                    f.write(f"{i:07d}; sample: {float(fid):.4f};\n")
 
             if i % args.save_every == 0:
                 torch.save(
@@ -406,7 +426,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_root", type=str, help="where to save training logs", default='logs')
     parser.add_argument("--log_every", type=int, default=100, help="save samples every # iters")
     parser.add_argument("--save_every", type=int, default=1000, help="save checkpoints every # iters")
-    parser.add_argument("--save_latest_every", type=int, default=100, help="save latest checkpoints every # iters")
+    parser.add_argument("--save_latest_every", type=int, default=200, help="save latest checkpoints every # iters")
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
@@ -498,13 +518,19 @@ if __name__ == "__main__":
         default=8,
         help="probability update interval of the adaptive augmentation",
     )
+    parser.add_argument("--debug", action='store_true')
     parser.add_argument("--inception", type=str, default=None, help="path to precomputed inception embedding")
     parser.add_argument("--eval_every", type=int, default=1000, help="interval of metric evaluation")
     parser.add_argument("--truncation", type=float, default=1, help="truncation factor")
     parser.add_argument("--n_sample_fid", type=int, default=50000, help="number of the samples for calculating FID")
     parser.add_argument("--resume", action='store_true')
     parser.add_argument("--n_step_d", type=int, default=1)
-    parser.add_argument("--which_phi", type=str, default='vec')
+    parser.add_argument("--which_phi", type=str, default='lin2')
+    parser.add_argument("--n_mlp_g", type=int, default=8)
+    parser.add_argument("--ema_kimg", type=int, default=10, help="Half-life of the exponential moving average (EMA) of generator weights.")
+    parser.add_argument("--ema_rampup", type=float, default=None, help="EMA ramp-up coefficient.")
+    parser.add_argument("--lambda_nda", type=float, default=1, help="the weight before G(z)")
+    parser.add_argument("--nda_type", type=str, default='jigsaw_4')
 
     args = parser.parse_args()
     util.seed_everything()
@@ -519,9 +545,10 @@ if __name__ == "__main__":
         synchronize()
 
     args.latent = 512
-    args.n_mlp = 8
+    # args.n_mlp = 8
 
     args.start_iter = 0
+    args.iter += 1
     util.set_log_dir(args)
     util.print_args(parser, args)
 
@@ -532,14 +559,14 @@ if __name__ == "__main__":
         from swagan import Generator, Discriminator
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp_g, channel_multiplier=args.channel_multiplier
     ).to(device)
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier,
         which_phi=args.which_phi,
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp_g, channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)

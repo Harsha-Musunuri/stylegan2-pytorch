@@ -14,7 +14,7 @@ from PIL import Image
 from tqdm import tqdm
 import util
 from calc_inception import load_patched_inception_v3
-from fid import extract_feature_from_samples, calc_fid, extract_feature_from_recon_hybrid
+from fid import extract_feature_from_samples, calc_fid, extract_feature_from_reconstruction
 import pickle
 import pdb
 st = pdb.set_trace
@@ -37,7 +37,7 @@ from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
 
-def manually_scale_grad(model, scale):
+def scale_grad(model, scale):
     if model is not None:
         for p in model.parameters():
             if p.grad is not None:
@@ -118,6 +118,22 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     return path_penalty, path_mean.detach(), path_lengths
 
 
+def calculate_adaptive_weight(nll_loss, g_loss, last_layer=None):
+    if last_layer is None:
+        return 1.0
+    nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)
+    g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)
+    if isinstance(last_layer, (list, tuple)):
+        nll_grads = torch.cat([v.view(-1) for v in nll_grads])
+        g_grads = torch.cat([v.view(-1) for v in g_grads])
+    else:
+        nll_grads = nll_grads[0]
+        g_grads = g_grads[0]
+    d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+    d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+    return d_weight
+
+
 def make_noise(batch, latent_dim, n_noise, device):
     if n_noise == 1:
         return torch.randn(batch, latent_dim, device=device)
@@ -168,7 +184,6 @@ def load_real_samples(args, data_iter):
 
 def train(args, loader, loader2, generator, encoder, discriminator, discriminator2,
           vggnet, g_optim, e_optim, d_optim, d2_optim, g_ema, e_ema, device):
-    # kwargs_d = {'detach_aux': args.detach_d_aux_head}
     inception = real_mean = real_cov = mean_latent = None
     if args.eval_every > 0:
         inception = nn.DataParallel(load_patched_inception_v3()).to(device)
@@ -217,27 +232,34 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         else:
             d2_module = discriminator2
 
-    accum = 0.5 ** (32 / (10 * 1000))
+    # When joint training enabled, d_weight balances reconstruction loss and adversarial loss on 
+    # recontructed real images. This does not balance the overall AE loss and GAN loss.
+    d_weight = torch.tensor(1.0, device=device)
+    last_layer = None
+    if args.use_adaptive_weight:
+        if args.distributed:
+            last_layer = generator.module.get_last_layer()
+        else:
+            last_layer = generator.get_last_layer()
+    g_scale = 1
+
+    # accum = 0.5 ** (32 / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
     r_t_stat = 0
     r_t_dict = {'real': 0, 'fake': 0, 'recx': 0}  # r_t stat
-    real_diff = fake_diff = count = 0
-    g_scale = 1
+
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, args.ada_every, device)
-    if args.decouple_d and args.augment:
-        ada_aug_p2 = args.augment_p if args.augment_p > 0 else 0.0
-        # r_t_stat2 = 0
-        if args.augment_p == 0:
-            ada_augment2 = AdaptiveAugment(args.ada_target, args.ada_length, args.ada_every, device)
+    ada_aug_p2 = args.augment_p if args.augment_p > 0 else 0.0
+    if args.decouple_d and args.augment and args.augment_p == 0:
+        ada_augment2 = AdaptiveAugment(args.ada_target, args.ada_length, args.ada_every, device)
 
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
     sample_x = load_real_samples(args, loader)
-    sample_x1 = sample_x2 = sample_idx = fid_batch_idx = None
     if sample_x.ndim > 4:
-        sample_x1 = sample_x[:,0,...]
-        sample_x2 = sample_x[:,-1,...]
         sample_x = sample_x[:,0,...]
+
+    input_is_latent = args.latent_space != 'z'  # Encode in z space?
 
     n_step_max = max(args.n_step_d, args.n_step_e)
 
@@ -251,6 +273,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
             print("Done!")
             break
 
+        if args.debug: util.seed_everything(i)
         real_imgs = [next(loader).to(device) for _ in range(n_step_max)]
 
         # Train Discriminator
@@ -260,11 +283,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         for step_index in range(args.n_step_d):
             real_img = real_imgs[step_index]
             noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-            if args.use_ema:
-                g_ema.eval()
-                fake_img, _ = g_ema(noise)
-            else:
-                fake_img, _ = generator(noise)
+            fake_img, _ = generator(noise)
             if args.augment:
                 real_img_aug, _ = augment(real_img, ada_aug_p)
                 fake_img, _ = augment(fake_img, ada_aug_p)
@@ -279,14 +298,8 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
 
             d_loss_rec = 0.
             if args.lambda_rec_d > 0 and not args.decouple_d:  # Do not train D on x_rec if decouple_d
-                if args.use_ema:
-                    e_ema.eval()
-                    g_ema.eval()
-                    latent_real, _ = e_ema(real_img)
-                    rec_img, _ = g_ema([latent_real], input_is_latent=True)
-                else:
-                    latent_real, _ = encoder(real_img)
-                    rec_img, _ = generator([latent_real], input_is_latent=True)
+                latent_real, _ = encoder(real_img)
+                rec_img, _ = generator([latent_real], input_is_latent=input_is_latent)
                 if args.augment:
                     rec_img, _ = augment(rec_img, ada_aug_p)
                 rec_pred = discriminator(rec_img)
@@ -307,17 +320,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         r_t_dict['real'] = torch.sign(real_pred).sum().item() / args.batch
         r_t_dict['fake'] = torch.sign(fake_pred).sum().item() / args.batch
 
-        with torch.no_grad():
-            real_diff += torch.mean(real_pred - rec_pred).item()
-            noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-            x_fake, _ = generator(noise)
-            x_recf, _ = generator([encoder(x_fake)[0]], input_is_latent=True)
-            recf_pred = discriminator(x_recf)
-            fake_pred = discriminator(x_fake)
-            fake_diff += torch.mean(fake_pred - recf_pred).item()
-            count += 1
-
-        d_regularize = i % args.d_reg_every == 0
+        d_regularize = args.d_reg_every > 0 and i % args.d_reg_every == 0
         if d_regularize:
             real_img.requires_grad = True
             if args.augment:
@@ -336,16 +339,11 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
             requires_grad(generator, False)
             requires_grad(encoder, False)
             requires_grad(discriminator2, True)
+            if args.debug: util.seed_everything(i)
             for step_index in range(args.n_step_e):  # n_step_d2 is same as n_step_e
                 real_img = real_imgs[step_index]
-                if args.use_ema:
-                    e_ema.eval()
-                    g_ema.eval()
-                    latent_real, _ = e_ema(real_img)
-                    rec_img, _ = g_ema([latent_real], input_is_latent=True)
-                else:
-                    latent_real, _ = encoder(real_img)
-                    rec_img, _ = generator([latent_real], input_is_latent=True)
+                latent_real, _ = encoder(real_img)
+                rec_img, _ = generator([latent_real], input_is_latent=input_is_latent)
                 if args.augment:
                     real_img_aug, _ = augment(real_img, ada_aug_p2)
                     rec_img, _ = augment(rec_img, ada_aug_p2)
@@ -364,8 +362,6 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                 d2_loss.backward()
                 d2_optim.step()
 
-                real_diff += torch.mean(real_pred - rec_pred).item()
-
             d_regularize = args.d_reg_every > 0 and i % args.d_reg_every == 0
             if d_regularize:
                 real_img.requires_grad = True
@@ -377,24 +373,21 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
             
             if args.augment and args.augment_p == 0:
                 ada_aug_p2 = ada_augment2.tune(rec_pred)
-                # r_t_stat2 = ada_augment2.r_t_stat
 
         r_t_dict['recx'] = torch.sign(rec_pred).sum().item() / args.batch
 
         # Train Encoder
+        joint = args.joint and g_scale > 1e-6
         requires_grad(encoder, True)
-        requires_grad(generator, args.train_ge)
+        requires_grad(generator, joint)
         requires_grad(discriminator, False)
         requires_grad(discriminator2, False)
+        if args.debug: util.seed_everything(i)
         pix_loss = vgg_loss = adv_loss = torch.tensor(0., device=device)
         for step_index in range(args.n_step_e):
             real_img = real_imgs[step_index]
             latent_real, _ = encoder(real_img)
-            if args.use_ema:
-                g_ema.eval()
-                rec_img, _ = g_ema([latent_real], input_is_latent=True)
-            else:
-                rec_img, _ = generator([latent_real], input_is_latent=True)
+            rec_img, _ = generator([latent_real], input_is_latent=input_is_latent)
             if args.lambda_pix > 0:
                 if args.pix_loss == 'l2':
                     pix_loss = torch.mean((rec_img - real_img) ** 2)
@@ -419,24 +412,45 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                     rec_pred = discriminator2(rec_img_aug)
                 adv_loss = g_nonsaturating_loss(rec_pred)
             
-            e_loss = pix_loss * args.lambda_pix + vgg_loss * args.lambda_vgg + adv_loss * args.lambda_adv
-            loss_dict["e"] = e_loss
+            if args.use_adaptive_weight and i >= args.disc_iter_start:
+                nll_loss = pix_loss * args.lambda_pix + vgg_loss * args.lambda_vgg
+                g_loss = adv_loss * args.lambda_adv
+                d_weight = calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
+
+            rec_w_loss = rec_fake_loss = 0
+            if args.lambda_rec_w > 0:
+                mixing_prob = 0 if args.which_latent == 'w_tied' else args.mixing
+                noise = mixing_noise(args.batch, args.latent, mixing_prob, device)
+                fake_img, latent_fake = generator(noise, return_latents=True)
+                if args.which_latent == 'w_tied':
+                    latent_fake = latent_fake[:,0,:]
+                else:
+                    latent_fake = latent_fake.view(args.batch, -1)
+                latent_pred, _ = encoder(fake_img)
+                rec_w_loss = torch.mean((latent_pred - latent_fake.detach()) ** 2)
+
+            ae_loss = (
+                pix_loss * args.lambda_pix + vgg_loss * args.lambda_vgg + 
+                d_weight * adv_loss * args.lambda_adv + 
+                rec_w_loss * args.lambda_rec_w
+            )
+            loss_dict["ae"] = ae_loss
             loss_dict["pix"] = pix_loss
             loss_dict["vgg"] = vgg_loss
             loss_dict["adv"] = adv_loss
 
-            if args.train_ge:
+            if joint:
                 encoder.zero_grad()
                 generator.zero_grad()
-                e_loss.backward()
+                ae_loss.backward()
                 e_optim.step()
-                if args.g_decay < 1:
-                    manually_scale_grad(generator, g_scale)
+                if args.g_decay is not None:
+                    scale_grad(generator, g_scale)
                     g_scale *= args.g_decay
                 g_optim.step()
             else:
                 encoder.zero_grad()
-                e_loss.backward()
+                ae_loss.backward()
                 e_optim.step()
 
         # Train Generator
@@ -444,7 +458,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         requires_grad(encoder, False)
         requires_grad(discriminator, False)
         requires_grad(discriminator2, False)
-        real_img = real_imgs[0]
+        if args.debug: util.seed_everything(i)
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, _ = generator(noise)
         if args.augment:
@@ -453,7 +467,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         g_loss_fake = g_nonsaturating_loss(fake_pred)
         loss_dict["g"] = g_loss_fake
         generator.zero_grad()
-        g_loss_fake.backward()
+        (g_loss_fake * args.lambda_fake_g).backward()
         g_optim.step()
 
         g_regularize = args.g_reg_every > 0 and i % args.g_reg_every == 0
@@ -476,12 +490,18 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
 
-        accumulate(e_ema, e_module, accum)
-        accumulate(g_ema, g_module, accum)
+        # Update EMA
+        ema_nimg = args.ema_kimg * 1000
+        if args.ema_rampup is not None:
+            ema_nimg = min(ema_nimg, i * args.batch * args.ema_rampup)
+        accum = 0.5 ** (args.batch / max(ema_nimg, 1e-8))
+        accumulate(g_ema, g_module, 0 if args.no_ema_g else accum)
+        accumulate(e_ema, e_module, 0 if args.no_ema_e else accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
         d_loss_val = loss_reduced["d"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
+        ae_loss_val = loss_reduced["ae"].mean().item()
         r1_val = loss_reduced["r1"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
@@ -497,64 +517,65 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
-                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
+                    f"d: {d_loss_val:.4f}; r1: {r1_val:.4f}; ae: {ae_loss_val:.4f}; "
+                    f"g: {g_loss_val:.4f}; path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
                     f"augment: {ada_aug_p:.4f}; "
-                    f"pix: {pix_loss_val:.4f}; vgg: {vgg_loss_val:.4f}; adv: {adv_loss_val:.4f}"
+                    f"d_weight: {d_weight.item():.4f}; "
+                    # f"pix: {pix_loss_val:.4f}; vgg: {vgg_loss_val:.4f}; adv: {adv_loss_val:.4f}"
                 )
             )
 
             if i % args.log_every == 0:
                 with torch.no_grad():
+                    g_ema.eval()
+                    e_ema.eval()
+                    nrow = int(args.n_sample ** 0.5)
+                    nchw = list(sample_x.shape)[1:]
+                    # Reconstruction of real images
                     latent_x, _ = e_ema(sample_x)
-                    fake_x, _ = generator([latent_x], input_is_latent=True, return_latents=False)
-                    sample_pix_loss = torch.sum((sample_x - fake_x) ** 2)
+                    rec_real, _ = g_ema([latent_x], input_is_latent=input_is_latent)
+                    sample = torch.cat((sample_x.reshape(args.n_sample//nrow, nrow, *nchw), 
+                                        rec_real.reshape(args.n_sample//nrow, nrow, *nchw)), 1)
+                    utils.save_image(
+                        sample.reshape(2*args.n_sample, *nchw),
+                        os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}-recon.png"),
+                        nrow=nrow,
+                        normalize=True,
+                        range=(-1, 1),
+                    )
+                    ref_pix_loss = torch.sum(torch.abs(sample_x - rec_real))
+                    ref_vgg_loss = torch.mean((vggnet(sample_x) - vggnet(rec_real)) ** 2) if vggnet is not None else 0
+                    # Fixed fake samples and reconstructions
+                    sample_gz, _ = g_ema([sample_z])
+                    latent_gz, _ = e_ema(sample_gz)
+                    rec_fake, _ = g_ema([latent_gz], input_is_latent=input_is_latent)
+                    sample = torch.cat((sample_gz.reshape(args.n_sample//nrow, nrow, *nchw), 
+                                        rec_fake.reshape(args.n_sample//nrow, nrow, *nchw)), 1)
+                    utils.save_image(
+                        sample.reshape(2*args.n_sample, *nchw),
+                        os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}-sample.png"),
+                        nrow=nrow,
+                        normalize=True,
+                        range=(-1, 1),
+                    )
+                    # gz_pix_loss = torch.sum(torch.abs(sample_gz - rec_fake))
+                    # gz_vgg_loss = torch.mean((vggnet(sample_gz) - vggnet(rec_fake)) ** 2) if vggnet is not None else 0
+
                 with open(os.path.join(args.log_dir, 'log.txt'), 'a+') as f:
                     f.write(
                         (
-                            f"{i:07d}; pix: {avg_pix_loss.avg:.4f}; vgg: {avg_vgg_loss.avg:.4f}; ref: {sample_pix_loss.item():.4f}; "
-                            f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
-                            f"path: {path_loss_val:.4f}; mean_path: {mean_path_length_avg:.4f}; "
+                            f"{i:07d}; "
+                            f"d: {d_loss_val:.4f}; r1: {r1_val:.4f}; ae: {ae_loss_val:.4f}; "
+                            f"g: {g_loss_val:.4f}; path: {path_loss_val:.4f}; mean_path: {mean_path_length_avg:.4f}; "
                             f"augment: {ada_aug_p:.4f}; {'; '.join([f'{k}: {r_t_dict[k]:.4f}' for k in r_t_dict])}; "
                             f"real_score: {real_score_val:.4f}; fake_score: {fake_score_val:.4f}; recx_score: {recx_score_val:.4f}; "
-                            f"real_diff: {real_diff/count:.4f}; fake_diff: {fake_diff/count:.4f};\n"
+                            f"pix: {avg_pix_loss.avg:.4f}; vgg: {avg_vgg_loss.avg:.4f}; "
+                            f"ref_pix: {ref_pix_loss.item():.4f}; ref_vgg: {ref_vgg_loss.item():.4f}; "
+                            # f"gz_pix: {gz_pix_loss.item():.4f}; gz_vgg: {gz_vgg_loss.item():.4f}; "
+                            f"d_weight: {d_weight.item():.4f}; "
+                            f"\n"
                         )
                     )
-                real_diff = fake_diff = count = 0
-
-            if args.eval_every > 0 and i % args.eval_every == 0:
-                with torch.no_grad():
-                    fid_sa = fid_re = fid_hy = 0
-                    # Sample FID
-                    g_ema.eval()
-                    if args.truncation < 1:
-                        mean_latent = g_ema.mean_latent(4096)
-                    features = extract_feature_from_samples(
-                        g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device
-                    ).numpy()
-                    sample_mean = np.mean(features, 0)
-                    sample_cov = np.cov(features, rowvar=False)
-                    fid_sa = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                    # Recon FID
-                    features = extract_feature_from_recon_hybrid(
-                        e_ema, g_ema, inception, args.truncation, mean_latent, loader2, args.device,
-                        mode='recon',
-                    ).numpy()
-                    sample_mean = np.mean(features, 0)
-                    sample_cov = np.cov(features, rowvar=False)
-                    fid_re = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                    # Hybrid FID
-                    if args.eval_hybrid:
-                        features = extract_feature_from_recon_hybrid(
-                            e_ema, g_ema, inception, args.truncation, mean_latent, loader2, args.device,
-                            mode='hybrid', # shuffle_idx=fid_batch_idx
-                        ).numpy()
-                        sample_mean = np.mean(features, 0)
-                        sample_cov = np.cov(features, rowvar=False)
-                        fid_hy = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                # print("Sample FID:", fid_sa, "Recon FID:", fid_re, "Hybrid FID:", fid_hy)
-                with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
-                    f.write(f"{i:07d}; sample fid: {float(fid_sa):.4f}; recon fid: {float(fid_re):.4f}; hybrid fid: {float(fid_hy):.4f};\n")
 
             if wandb and args.wandb:
                 wandb.log(
@@ -572,56 +593,41 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                     }
                 )
 
-            if i % args.log_every == 0:
+            if args.eval_every > 0 and i % args.eval_every == 0:
                 with torch.no_grad():
+                    fid_sa = fid_re = fid_sr = 0
                     g_ema.eval()
                     e_ema.eval()
-                    nrow = int(args.n_sample ** 0.5)
-                    nchw = list(sample_x.shape)[1:]
-                    # Fixed fake samples
-                    sample, _ = g_ema([sample_z])
-                    utils.save_image(
-                        sample,
-                        os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}-sample.png"),
-                        nrow=int(args.n_sample ** 0.5),
-                        normalize=True,
-                        range=(-1, 1),
-                    )
-                    # Reconstruction samples
-                    latent_real, _ = e_ema(sample_x)
-                    fake_img, _ = g_ema([latent_real], input_is_latent=True, return_latents=False)
-                    sample = torch.cat((sample_x.reshape(args.n_sample//nrow, nrow, *nchw), 
-                                        fake_img.reshape(args.n_sample//nrow, nrow, *nchw)), 1)
-                    utils.save_image(
-                        sample.reshape(2*args.n_sample, *nchw),
-                        os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}-recon.png"),
-                        nrow=nrow,
-                        normalize=True,
-                        range=(-1, 1),
-                    )
-                    # Hybrid samples: [real_y1, real_y2; real_x1, fake_x2]
-                    if args.eval_hybrid:
-                        w1, _ = e_ema(sample_x1)
-                        w2, _ = e_ema(sample_x2)
-                        dw = w2 - w1
-                        dw = torch.cat(dw.chunk(2, 0)[::-1], 0) if sample_idx is None else dw[sample_idx,...]
-                        fake_img, _ = g_ema([w1 + dw], input_is_latent=True, return_latents=False)
-                        drive = torch.cat((
-                            torch.cat(sample_x1.chunk(2, 0)[::-1], 0).reshape(args.n_sample, 1, *nchw),
-                            torch.cat(sample_x2.chunk(2, 0)[::-1], 0).reshape(args.n_sample, 1, *nchw)), 1)
-                        source = torch.cat((
-                            sample_x1.reshape(args.n_sample, 1, *nchw),
-                            fake_img.reshape(args.n_sample, 1, *nchw)), 1)
-                        sample = torch.cat((
-                            drive.reshape(args.n_sample//nrow, 2*nrow, *nchw),
-                            source.reshape(args.n_sample//nrow, 2*nrow, *nchw)), 1)
-                        utils.save_image(
-                            sample.reshape(4*args.n_sample, *nchw),
-                            os.path.join(args.log_dir, 'sample', f"{str(i).zfill(6)}-cross.png"),
-                            nrow=2*nrow,
-                            normalize=True,
-                            range=(-1, 1),
-                        )
+                    if args.truncation < 1:
+                        mean_latent = g_ema.mean_latent(4096)
+                    # Sample FID
+                    if 'fid_sample' in args.which_metric:
+                        features = extract_feature_from_samples(
+                            g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device
+                        ).numpy()
+                        sample_mean = np.mean(features, 0)
+                        sample_cov = np.cov(features, rowvar=False)
+                        fid_sa = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                    # Sample reconstruction FID
+                    if 'fid_sample_recon' in args.which_metric:
+                        features = extract_feature_from_samples(
+                            g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device,
+                            mode='recon', encoder=e_ema, input_is_latent=input_is_latent,
+                        ).numpy()
+                        sample_mean = np.mean(features, 0)
+                        sample_cov = np.cov(features, rowvar=False)
+                        fid_sr = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                    # Real reconstruction FID
+                    if 'fid_recon' in args.which_metric:
+                        features = extract_feature_from_reconstruction(
+                            e_ema, g_ema, inception, args.truncation, mean_latent, loader2, args.device,
+                            input_is_latent=input_is_latent, mode='recon',
+                        ).numpy()
+                        sample_mean = np.mean(features, 0)
+                        sample_cov = np.cov(features, rowvar=False)
+                        fid_re = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
+                    f.write(f"{i:07d}; sample: {float(fid_sa):.4f}; rec_fake: {float(fid_sr):.4f}; rec_real: {float(fid_re):.4f};\n")
 
             if i % args.save_every == 0:
                 torch.save(
@@ -638,6 +644,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                         "d2_optim": d2_optim.state_dict() if args.decouple_d else None,
                         "args": args,
                         "ada_aug_p": ada_aug_p,
+                        "ada_aug_p2": ada_aug_p2,
                         "iter": i,
                     },
                     os.path.join(args.log_dir, 'weight', f"{str(i).zfill(6)}.pt"),
@@ -658,6 +665,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                         "d2_optim": d2_optim.state_dict() if args.decouple_d else None,
                         "args": args,
                         "ada_aug_p": ada_aug_p,
+                        "ada_aug_p2": ada_aug_p2,
                         "iter": i,
                     },
                     os.path.join(args.log_dir, 'weight', f"latest.pt"),
@@ -678,7 +686,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_root", type=str, help="where to save training logs", default='logs')
     parser.add_argument("--log_every", type=int, default=100, help="save samples every # iters")
     parser.add_argument("--save_every", type=int, default=1000, help="save checkpoints every # iters")
-    parser.add_argument("--save_latest_every", type=int, default=100, help="save latest checkpoints every # iters")
+    parser.add_argument("--save_latest_every", type=int, default=200, help="save latest checkpoints every # iters")
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
@@ -770,6 +778,7 @@ if __name__ == "__main__":
         default=8,
         help="probability update interval of the adaptive augmentation",
     )
+    parser.add_argument("--debug", action='store_true')
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--which_encoder", type=str, default='style')
     parser.add_argument("--which_latent", type=str, default='w_plus')
@@ -781,27 +790,38 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_adv", type=float, default=0.1)
     parser.add_argument("--lambda_pix", type=float, default=1.0, help="recon loss on pixel (x)")
     parser.add_argument("--lambda_fake_d", type=float, default=1.0)
-    parser.add_argument("--lambda_rec_d", type=float, default=1.0)
+    parser.add_argument("--lambda_rec_d", type=float, default=1.0, help="d1, recon of real image")
+    parser.add_argument("--lambda_fake_g", type=float, default=1.0)
+    parser.add_argument("--lambda_rec_w", type=float, default=0, help="recon sampled w")
     parser.add_argument("--pix_loss", type=str, default='l2')
-    parser.add_argument("--train_ge", action='store_true', help="update generator with encoder")
+    parser.add_argument("--joint", action='store_true', help="update generator with encoder")
     parser.add_argument("--inception", type=str, default=None, help="path to precomputed inception embedding")
     parser.add_argument("--eval_every", type=int, default=1000, help="interval of metric evaluation")
     parser.add_argument("--truncation", type=float, default=1, help="truncation factor")
     parser.add_argument("--n_sample_fid", type=int, default=50000, help="number of the samples for calculating FID")
     parser.add_argument("--nframe_num", type=int, default=5)
     parser.add_argument("--decouple_d", action='store_true')
-    parser.add_argument("--use_ema", action='store_true')
     parser.add_argument("--n_step_d", type=int, default=1)
     parser.add_argument("--n_step_e", type=int, default=1)
-    parser.add_argument("--debug", type=str, default='none')
     parser.add_argument("--resume", action='store_true')
     parser.add_argument("--e_ckpt", type=str, default=None, help="path to the checkpoint of encoder")
     parser.add_argument("--g_ckpt", type=str, default=None, help="path to the checkpoint of generator")
     parser.add_argument("--d_ckpt", type=str, default=None, help="path to the checkpoint of discriminator")
+    parser.add_argument("--d2_ckpt", type=str, default=None, help="path to the checkpoint of discriminator2")
     parser.add_argument("--train_from_scratch", action='store_true')
     parser.add_argument("--limit_train_batches", type=float, default=1)
-    parser.add_argument("--no_eval_hybrid", action='store_true')
-    parser.add_argument("--g_decay", type=float, default=1, help="g decay factor")
+    parser.add_argument("--g_decay", type=float, default=None, help="g decay factor")
+    parser.add_argument("--n_mlp_g", type=int, default=8)
+    parser.add_argument("--ema_kimg", type=int, default=10, help="Half-life of the exponential moving average (EMA) of generator weights.")
+    parser.add_argument("--ema_rampup", type=float, default=None, help="EMA ramp-up coefficient.")
+    parser.add_argument("--no_ema_e", action='store_true')
+    parser.add_argument("--no_ema_g", action='store_true')
+    parser.add_argument("--which_metric", type=str, nargs='*', default=['fid_sample', 'fid_sample_recon', 'fid_recon'])
+    parser.add_argument("--use_adaptive_weight", action='store_true', help="adaptive weight borrowed from VQGAN")
+    parser.add_argument("--disc_iter_start", type=int, default=30000)
+    parser.add_argument("--which_phi_e", type=str, default='lin2')
+    parser.add_argument("--which_phi_d", type=str, default='lin2')
+    parser.add_argument("--latent_space", type=str, default='w', help="latent space (w | p | pn | z)")
 
     args = parser.parse_args()
     util.seed_everything()
@@ -815,17 +835,21 @@ if __name__ == "__main__":
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
 
-    args.n_mlp = 8
+    # args.n_mlp = 8
     args.n_latent = int(np.log2(args.size)) * 2 - 2
     args.latent = 512
     if args.which_latent == 'w_plus':
         args.latent_full = args.latent * args.n_latent
-    elif args.which_latent == 'w_shared':
+    elif args.which_latent == 'w_tied':
         args.latent_full = args.latent
     else:
         raise NotImplementedError
 
+    assert((not args.use_adaptive_weight) or args.joint)
+    assert(args.latent_space in ['w', 'z'])
+
     args.start_iter = 0
+    args.iter += 1
     util.set_log_dir(args)
     util.print_args(parser, args)
 
@@ -836,13 +860,13 @@ if __name__ == "__main__":
         from swagan import Generator, Discriminator
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp_g, channel_multiplier=args.channel_multiplier
     ).to(device)
     discriminator = Discriminator(
-        args.size, channel_multiplier=args.channel_multiplier,
+        args.size, channel_multiplier=args.channel_multiplier, which_phi=args.which_phi_d
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp_g, channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
@@ -864,7 +888,7 @@ if __name__ == "__main__":
     discriminator2 = d2_optim = None
     if args.decouple_d:
         discriminator2 = Discriminator(
-            args.size, channel_multiplier=args.channel_multiplier,
+            args.size, channel_multiplier=args.channel_multiplier, which_phi=args.which_phi_d
         ).to(device)
         d2_optim = optim.Adam(
             discriminator2.parameters(),
@@ -876,17 +900,17 @@ if __name__ == "__main__":
     if args.which_encoder == 'idinvert':
         from idinvert_pytorch.models.stylegan_encoder_network import StyleGANEncoderNet
         encoder = StyleGANEncoderNet(resolution=args.size, w_space_dim=args.latent,
-            which_latent=args.which_latent, reshape_latent=True,
-            use_wscale=args.use_wscale).to(device)
+            which_latent=args.which_latent, use_wscale=args.use_wscale).to(device)
         e_ema = StyleGANEncoderNet(resolution=args.size, w_space_dim=args.latent,
-            which_latent=args.which_latent, reshape_latent=True,
-            use_wscale=args.use_wscale).to(device)
+            which_latent=args.which_latent, use_wscale=args.use_wscale).to(device)
     else:
         from model import Encoder
         encoder = Encoder(args.size, args.latent, channel_multiplier=args.channel_multiplier,
-            which_latent=args.which_latent, reshape_latent=True, stddev_group=args.stddev_group).to(device)
+            which_latent=args.which_latent, which_phi=args.which_phi_e,
+            stddev_group=args.stddev_group).to(device)
         e_ema = Encoder(args.size, args.latent, channel_multiplier=args.channel_multiplier,
-            which_latent=args.which_latent, reshape_latent=True, stddev_group=args.stddev_group).to(device)
+            which_latent=args.which_latent, which_phi=args.which_phi_e,
+            stddev_group=args.stddev_group).to(device)
     e_ema.eval()
     accumulate(e_ema, encoder, 0)
     
@@ -931,6 +955,7 @@ if __name__ == "__main__":
         if discriminator2 is not None:
             discriminator2.load_state_dict(ckpt["d2"])
             d2_optim.load_state_dict(ckpt["d2_optim"])
+
     elif not args.train_from_scratch:
         if args.e_ckpt is not None:
             print("load e model:", args.e_ckpt)
@@ -949,6 +974,11 @@ if __name__ == "__main__":
             d_ckpt = torch.load(args.d_ckpt, map_location=lambda storage, loc: storage)
             discriminator.load_state_dict(d_ckpt["d"])
             d_optim.load_state_dict(d_ckpt["d_optim"])
+        if args.d2_ckpt is not None:
+            print("load d2 model:", args.d2_ckpt)
+            d2_ckpt = torch.load(args.d2_ckpt, map_location=lambda storage, loc: storage)
+            discriminator2.load_state_dict(d2_ckpt["d"])
+            d2_optim.load_state_dict(d2_ckpt["d_optim"])
 
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(
@@ -977,7 +1007,6 @@ if __name__ == "__main__":
                 broadcast_buffers=False,
             )
 
-    args.eval_hybrid = not args.no_eval_hybrid and args.dataset == 'videofolder'
     dataset = get_image_dataset(args, args.dataset, args.path, train=True)
     if args.limit_train_batches < 1:
         indices = torch.randperm(len(dataset))[:int(args.limit_train_batches * len(dataset))]
@@ -994,23 +1023,8 @@ if __name__ == "__main__":
     # A subset of length args.n_sample_fid for FID evaluation
     loader2 = None
     if args.eval_every > 0:
-        if args.eval_hybrid:
-            transform = transforms.Compose(
-                [
-                    transforms.RandomHorizontalFlip(),
-                    transforms.Resize(args.size),
-                    transforms.CenterCrop(args.size),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-                ]
-            )
-            dataset2 = VideoFolderDataset(args.path, transform, mode='nframe',
-                nframe_num=args.nframe_num, cache=args.cache, unbind=False,
-            )
-            indices = torch.randperm(len(dataset2))[:args.n_sample_fid]
-            dataset2 = data.Subset(dataset2, indices)
-        else:
-            indices = torch.randperm(len(dataset))[:args.n_sample_fid]
-            dataset2 = data.Subset(dataset, indices)
+        indices = torch.randperm(len(dataset))[:args.n_sample_fid]
+        dataset2 = data.Subset(dataset, indices)
         loader2 = data.DataLoader(dataset2, batch_size=64, num_workers=4, shuffle=False)
         if args.sample_cache is not None:
             load_real_samples(args, sample_data(loader2))
