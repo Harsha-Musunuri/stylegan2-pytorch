@@ -587,7 +587,8 @@ if __name__ == "__main__":
 
     if args.resume:
         if args.ckpt is None:
-            args.ckpt = os.path.join(args.log_dir, 'weight', f"latest.pt")
+            # args.ckpt = os.path.join(args.log_dir, 'weight', f"latest.pt")
+            args.ckpt=""
         print("load model:", args.ckpt)
 
         ckpt = torch.load(args.ckpt, map_location=lambda storage, loc: storage)

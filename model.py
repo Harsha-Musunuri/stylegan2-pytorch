@@ -584,7 +584,7 @@ class Generator(nn.Module):
 
     def forward(
         self,
-        styles,
+        styles, #styles is z;
         return_latents=False,
         inject_index=None,
         truncation=1,

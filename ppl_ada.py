@@ -15,7 +15,7 @@ import copy
 import numpy as np
 import torch
 import dnnlib
-from . import metric_utils
+import metric_utils
 
 #----------------------------------------------------------------------------
 
@@ -76,9 +76,9 @@ class PPLSampler(torch.nn.Module):
             img = img[:, :, c*3 : c*7, c*2 : c*6]
 
         # Downsample to 256x256.
-        factor = self.G.img_resolution // 256
-        if factor > 1:
-            img = img.reshape([-1, img.shape[1], img.shape[2] // factor, factor, img.shape[3] // factor, factor]).mean([3, 5])
+        # factor = self.G.img_resolution // 256
+        # if factor > 1:
+        #     img = img.reshape([-1, img.shape[1], img.shape[2] // factor, factor, img.shape[3] // factor, factor]).mean([3, 5])
 
         # Scale dynamic range from [-1,1] to [0,255].
         img = (img + 1) * (255 / 2)
@@ -91,7 +91,7 @@ class PPLSampler(torch.nn.Module):
         return dist
 
 #----------------------------------------------------------------------------
-
+#num_samples=50000; batchsize=2
 def compute_ppl(opts, num_samples, epsilon, space, sampling, crop, batch_size, jit=False):
     dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
     vgg16_url = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/vgg16.pt'
@@ -107,10 +107,10 @@ def compute_ppl(opts, num_samples, epsilon, space, sampling, crop, batch_size, j
     # Sampling loop.
     dist = []
     progress = opts.progress.sub(tag='ppl sampling', num_items=num_samples)
-    for batch_start in range(0, num_samples, batch_size * opts.num_gpus):
+    for batch_start in range(0, num_samples, batch_size * opts.num_gpus): # 0 to 50000 in steps of 2
         progress.update(batch_start)
-        c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)]
-        c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
+        c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)] #list of labels
+        c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device) #create ndarray from batchsize x size of each one hot
         x = sampler(c)
         for src in range(opts.num_gpus):
             y = x.clone()
