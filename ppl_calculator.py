@@ -4,6 +4,7 @@ import numpy as np
 import copy
 from model import Generator
 from tqdm import tqdm
+from torch import nn
 
 # print(generator)
 
@@ -77,9 +78,9 @@ def compute_ppl(Generator,GMapper, num_samples, epsilon, batch_size, device):
     dist = []
     for batch_start in tqdm(range(0, num_samples, batch_size)):
         x = sampler(batch_size)
-        for src in range(1):
-            y = x.clone()
-            dist.append(y)
+        # for src in range(1):
+        #     y = x.clone()
+        dist.append(x)
 
     # Compute PPL.
     dist = torch.cat(dist)[:num_samples].cpu().numpy()
@@ -91,18 +92,19 @@ def compute_ppl(Generator,GMapper, num_samples, epsilon, batch_size, device):
 
 if __name__ == "__main__":
     with torch.no_grad():
-        ckpt = "/common/users/sm2322/MS-Thesis/GAN-Thesis-Work-Remote/styleGAN2-AE-Ligong-Remote/trainedPts/168000.pt"
+        ckpt = "/common/users/sm2322/MS-Thesis/GAN-Thesis-Work-Remote/styleGAN2-AE-Ligong-Remote/trainedPts/gan/168000.pt"
         ckpt = torch.load(ckpt, map_location=lambda storage, loc: storage)
         device = "cuda"
         generator = Generator(128, 512, 8, 2).to(device)
-        generator.load_state_dict(ckpt["g"])
+        # print(ckpt.keys())
+        generator.load_state_dict(ckpt["g_ema"])
         generator.eval()
 
         n_samples = 50000
 
         epsilon = 1e-4
-        for module in generator.named_children():
-            GMapper = copy.deepcopy(module[1])
-            break
-        pplScore=compute_ppl(Generator=generator,GMapper=GMapper,num_samples=n_samples,epsilon=epsilon,batch_size=2,device=device)
+        G_Synthesis = list(generator.children())[1:]
+        G_Synthesis = nn.Sequential(*G_Synthesis)
+        G_Mapping = list(generator.children())[0]
+        pplScore=compute_ppl(Generator=G_Synthesis,GMapper=G_Mapping,num_samples=n_samples,epsilon=epsilon,batch_size=2,device=device)
         print("ppl score is :",pplScore)
