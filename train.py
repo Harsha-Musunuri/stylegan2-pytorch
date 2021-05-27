@@ -115,11 +115,11 @@ def make_noise(batch, latent_dim, n_noise, device):
     if n_noise == 1:
         return torch.randn(batch, latent_dim, device=device)
 
-    noises = torch.randn(n_noise, batch, latent_dim, device=device).unbind(0)
+    noises = torch.randn(n_noise, batch, latent_dim, device=device).unbind(0) #return tuple sliced in the dim provided here 0 dim
 
     return noises
 
-
+#mixing_noise(args.batch=16, args.latent=512, args.mixing=0.9, device)
 def mixing_noise(batch, latent_dim, prob, device):
     if prob > 0 and random.random() < prob:
         return make_noise(batch, latent_dim, 2, device)
@@ -136,13 +136,13 @@ def set_grad_none(model, targets):
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     inception = real_mean = real_cov = mean_latent = None
-    if args.eval_every > 0:
-        inception = nn.DataParallel(load_patched_inception_v3()).to(device)
-        inception.eval()
-        with open(args.inception, "rb") as f:
-            embeds = pickle.load(f)
-            real_mean = embeds["mean"]
-            real_cov = embeds["cov"]
+    # if args.eval_every > 0:
+    #     inception = nn.DataParallel(load_patched_inception_v3()).to(device)
+    #     inception.eval()
+    #     with open(args.inception, "rb") as f:
+    #         embeds = pickle.load(f)
+    #         real_mean = embeds["mean"]
+    #         real_cov = embeds["cov"]
     if get_rank() == 0:
         if args.eval_every > 0:
             with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
@@ -199,6 +199,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             real_img = next(loader).to(device)
 
             noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+            print("type of noise1",noise[0].shape)
+            print("about to enter generator1")
+            # print("noise1 shape is ",noise.shape)
             fake_img, _ = generator(noise)
 
             if args.augment:
@@ -262,6 +265,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if args.debug: util.seed_everything(i)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        # print("about to enter generator2")
+        # print("noise2 shape is ", noise.shape)
         fake_img, _ = generator(noise)
 
         if args.augment:
@@ -280,6 +285,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
+            # print("about to enter generator3")
+            # print("noise3 shape is ", noise.shape)
             fake_img, latents = generator(noise, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
@@ -333,6 +340,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if i % args.log_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
+                    print("about to enter g_ema1")
+                    print("sample_z1 shape is ", sample_z.shape)
                     sample, _ = g_ema([sample_z])
                     utils.save_image(
                         sample,
@@ -371,16 +380,16 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if args.eval_every > 0 and i % args.eval_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    if args.truncation < 1:
-                        mean_latent = g_ema.mean_latent(4096)
-                    features = extract_feature_from_samples(
-                        g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device
-                    ).numpy()
-                    sample_mean = np.mean(features, 0)
-                    sample_cov = np.cov(features, rowvar=False)
-                    fid = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
-                    f.write(f"{i:07d}; sample: {float(fid):.4f};\n")
+                    # if args.truncation < 1:
+                    #     mean_latent = g_ema.mean_latent(4096)
+                    # features = extract_feature_from_samples(
+                    #     g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device
+                    # ).numpy()
+                    # sample_mean = np.mean(features, 0)
+                    # sample_cov = np.cov(features, rowvar=False)
+                    # fid = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                # with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
+                #     f.write(f"{i:07d}; sample: {float(fid):.4f};\n")
 
             if i % args.save_every == 0:
                 torch.save(

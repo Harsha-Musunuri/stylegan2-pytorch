@@ -1,85 +1,7 @@
-
 import torch
 from torchvision import  utils
 from model import Generator
-
-
-
-
-# with torch.no_grad():
-#     ckpt = "/common/users/sm2322/MS-Thesis/GAN-Thesis-Work-Remote/styleGAN2-AE-Ligong-Remote/trainedPts/aegan/168000.pt"
-#     ckpt = torch.load(ckpt, map_location=lambda storage, loc: storage)
-#     device = "cuda"
-#     generator = Generator(128, 512, 8, 2).to(device)
-#     generator.load_state_dict(ckpt["g_ema"])
-#     generator.eval()
-#     print(list(generator.children()))
-
-    # #### Norm+MLP block
-    # G_Norm_MLP = list(generator.children())[0]
-    # # print(G_Norm_MLP)
-    #
-    # sample_z = torch.randn(1, 512, device=device)
-    #
-    # print("initial styles type is: ", type(sample_z))
-    # # if not input_is_latent:  # if `style' is z, then get w = self.style(z)
-    # styles = [G_Norm_MLP(s) for s in [sample_z]]
-    # # print(type(styles))
-    # latent = styles[0].unsqueeze(1).repeat(1, 12, 1)
-    # print(latent.shape) #latent is wat the enters input block and moves forward
-    # #### Norm+MLP blocks end
-    #
-    # num_layers=12
-    # noise = [None] * num_layers
-    #
-    # #### constant input block
-    # G_Const_Input = list(generator.children())[1]
-    # out = G_Const_Input(latent)
-    # print("out shape is after G_const_Input :",out.shape)
-    # #### constant input block ends
-    #
-    # #### conv1 block
-    # conv1=list(generator.children())[2]
-    # out = conv1(out, latent[:, 0], noise=noise[0])
-    # print("out shape is after conv1 :",out.shape)
-    # #### conv1 block ends
-    #
-    # #### to rgb1 block
-    # to_rgb1=list(generator.children())[3]
-    # skip = to_rgb1(out, latent[:, 1])
-    # print("out shape is after rgb1 :",out.shape)
-    # #### to rgb1 blokc ends
-    #
-    # #### remaining blocks
-    # convs=list(generator.children())[4]
-    # # print("convs is : ",convs)
-    # to_rgbs=list(generator.children())[6]
-    # # print("rgbs is :",to_rgbs)
-    #
-    # i = 1
-    # for conv1, conv2, noise1, noise2, to_rgb in zip(
-    #         convs[::2], convs[1::2], noise[1::2], noise[2::2], to_rgbs
-    # ):
-    #     out = conv1(out, latent[:, i], noise=noise1)
-    #     out = conv2(out, latent[:, i + 1], noise=noise2)
-    #     skip = to_rgb(out, latent[:, i + 2], skip)
-    #     print("skip shape is : ", skip.shape)
-    #
-    #     i += 2
-    # image=skip
-    # #### remaining blocks ends
-    #
-    # ####save image
-    # utils.save_image(
-    #     image,
-    #     "blockWiseThings.png",
-    #     nrow=int(1 ** 0.5),
-    #     normalize=True,
-    #     range=(-1, 1),
-    # )
-    # ####save image ends
-
-
+import lpips
 class GeneratorBlocks:
     def __init__(self,generator):
         self.G_Norm_MLP = list(generator.children())[0]
@@ -138,34 +60,38 @@ class GeneratorBlocks:
 
 
 if __name__ == "__main__":
+    loss_fn_vgg = lpips.PerceptualLoss(net='vgg')
     with torch.no_grad():
-        ckpt = "/common/users/sm2322/MS-Thesis/GAN-Thesis-Work-Remote/styleGAN2-AE-Ligong-Remote/trainedPts/aegan/168000.pt"
+        ckpt = "/common/users/sm2322/MS-Thesis/GAN-Thesis-Work-Remote/styleGAN2-AE-Ligong-Remote/trainedPts/gan/168000.pt"
         ckpt = torch.load(ckpt, map_location=lambda storage, loc: storage)
         device = "cuda"
         generator = Generator(128, 512, 8, 2).to(device)
         generator.load_state_dict(ckpt["g_ema"])
         generator.eval()
         # print(list(generator.children()))
-        sample_z = torch.randn(1, 512, device=device)
+        z0, z1 = torch.randn([1 * 2, 512], device=device).chunk(2)
+        # sample_z = torch.randn(1, 512, device=device)
+
         genBlocks=GeneratorBlocks(generator)
-        styleVecs,LatentVecs=genBlocks.G_Mapper(sample_z)
-        image=genBlocks.G_Synthesis(LatentVecs)
-        genBlocks.saveImage(image,"bullockCart")
+        w0,stackW0=genBlocks.G_Mapper(z0)
+        w1,stackW1=genBlocks.G_Mapper(z1)
+
+        epsilon = 1e-4
+        t = torch.rand(1,device=device)[:, None]
+        print(t.shape)
+        interpolated_1 = torch.lerp(w0[0], w1[0], t)
+        interpolated_2 = torch.lerp(w0[0], w1[0], t + epsilon)
+        print(interpolated_1.shape, interpolated_2.shape)
+        interpolated_1 = interpolated_1.unsqueeze(1).repeat(1, 12, 1)
+        interpolated_2 = interpolated_2.unsqueeze(1).repeat(1, 12, 1)
+        image1=genBlocks.G_Synthesis(interpolated_1)
+        image2=genBlocks.G_Synthesis(interpolated_2)
+        genBlocks.saveImage(image1,"image1_1-synth-latest")
+        genBlocks.saveImage(image2,"image2_1-synth-latest")
+        cur_lpips = loss_fn_vgg(image1, image2).item()
+        print(f"Image LPIPS is {cur_lpips}")
+        ppl = cur_lpips / (epsilon ** 2)
+        print(f"Our final sample PPL is {ppl}")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        # generator([z0])

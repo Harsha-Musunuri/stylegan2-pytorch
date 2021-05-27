@@ -177,21 +177,21 @@ def load_real_samples(args, data_iter):
         sample_x = torch.from_numpy(np.load(npy_path)).to(args.device)
     else:
         sample_x = accumulate_batches(data_iter, args.n_sample).to(args.device)
-        if npy_path is not None:
-            np.save(npy_path, sample_x.cpu().numpy())
+        # if npy_path is not None:
+            # np.save(npy_path, sample_x.cpu().numpy())
     return sample_x
 
 
 def train(args, loader, loader2, generator, encoder, discriminator, discriminator2,
-          vggnet, g_optim, e_optim, d_optim, d2_optim, g_ema, e_ema, device):
-    inception = real_mean = real_cov = mean_latent = None
-    if args.eval_every > 0:
-        inception = nn.DataParallel(load_patched_inception_v3()).to(device)
-        inception.eval()
-        with open(args.inception, "rb") as f:
-            embeds = pickle.load(f)
-            real_mean = embeds["mean"]
-            real_cov = embeds["cov"]
+          g_optim, e_optim, d_optim, d2_optim, g_ema, e_ema, device):
+    # inception = real_mean = real_cov = mean_latent = None
+    # if args.eval_every > 0:
+    #     inception = nn.DataParallel(load_patched_inception_v3()).to(device)
+    #     inception.eval()
+    #     with open(args.inception, "rb") as f:
+    #         embeds = pickle.load(f)
+    #         real_mean = embeds["mean"]
+    #         real_cov = embeds["cov"]
     if get_rank() == 0:
         if args.eval_every > 0:
             with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
@@ -395,8 +395,8 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                     pix_loss = F.l1_loss(rec_img, real_img)
                 else:
                     raise NotImplementedError
-            if args.lambda_vgg > 0:
-                vgg_loss = torch.mean((vggnet(real_img) - vggnet(rec_img)) ** 2)
+            # if args.lambda_vgg > 0:
+            # # vgg_loss = torch.mean((vggnet(real_img) - vggnet(rec_img)) ** 2)
             if args.lambda_adv > 0:
                 if not args.decouple_d:
                     if args.augment:
@@ -529,8 +529,10 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                 with torch.no_grad():
                     g_ema.eval()
                     e_ema.eval()
+
                     nrow = int(args.n_sample ** 0.5)
                     nchw = list(sample_x.shape)[1:]
+                    print("sample_x.shape is ", type(nchw))
                     # Reconstruction of real images
                     latent_x, _ = e_ema(sample_x)
                     rec_real, _ = g_ema([latent_x], input_is_latent=input_is_latent)
@@ -544,7 +546,7 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                         range=(-1, 1),
                     )
                     ref_pix_loss = torch.sum(torch.abs(sample_x - rec_real))
-                    ref_vgg_loss = torch.mean((vggnet(sample_x) - vggnet(rec_real)) ** 2) if vggnet is not None else 0
+                    # ref_vgg_loss = torch.mean((vggnet(sample_x) - vggnet(rec_real)) ** 2) if vggnet is not None else 0
                     # Fixed fake samples and reconstructions
                     sample_gz, _ = g_ema([sample_z])
                     latent_gz, _ = e_ema(sample_gz)
@@ -601,33 +603,33 @@ def train(args, loader, loader2, generator, encoder, discriminator, discriminato
                     if args.truncation < 1:
                         mean_latent = g_ema.mean_latent(4096)
                     # Sample FID
-                    if 'fid_sample' in args.which_metric:
-                        features = extract_feature_from_samples(
-                            g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device
-                        ).numpy()
-                        sample_mean = np.mean(features, 0)
-                        sample_cov = np.cov(features, rowvar=False)
-                        fid_sa = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                    # Sample reconstruction FID
-                    if 'fid_sample_recon' in args.which_metric:
-                        features = extract_feature_from_samples(
-                            g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device,
-                            mode='recon', encoder=e_ema, input_is_latent=input_is_latent,
-                        ).numpy()
-                        sample_mean = np.mean(features, 0)
-                        sample_cov = np.cov(features, rowvar=False)
-                        fid_sr = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                    # Real reconstruction FID
-                    if 'fid_recon' in args.which_metric:
-                        features = extract_feature_from_reconstruction(
-                            e_ema, g_ema, inception, args.truncation, mean_latent, loader2, args.device,
-                            input_is_latent=input_is_latent, mode='recon',
-                        ).numpy()
-                        sample_mean = np.mean(features, 0)
-                        sample_cov = np.cov(features, rowvar=False)
-                        fid_re = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
-                with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
-                    f.write(f"{i:07d}; sample: {float(fid_sa):.4f}; rec_fake: {float(fid_sr):.4f}; rec_real: {float(fid_re):.4f};\n")
+                #     if 'fid_sample' in args.which_metric:
+                #         features = extract_feature_from_samples(
+                #             g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device
+                #         ).numpy()
+                #         sample_mean = np.mean(features, 0)
+                #         sample_cov = np.cov(features, rowvar=False)
+                #         fid_sa = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                #     # Sample reconstruction FID
+                #     if 'fid_sample_recon' in args.which_metric:
+                #         features = extract_feature_from_samples(
+                #             g_ema, inception, args.truncation, mean_latent, 64, args.n_sample_fid, args.device,
+                #             mode='recon', encoder=e_ema, input_is_latent=input_is_latent,
+                #         ).numpy()
+                #         sample_mean = np.mean(features, 0)
+                #         sample_cov = np.cov(features, rowvar=False)
+                #         fid_sr = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                #     # Real reconstruction FID
+                #     if 'fid_recon' in args.which_metric:
+                #         features = extract_feature_from_reconstruction(
+                #             e_ema, g_ema, inception, args.truncation, mean_latent, loader2, args.device,
+                #             input_is_latent=input_is_latent, mode='recon',
+                #         ).numpy()
+                #         sample_mean = np.mean(features, 0)
+                #         sample_cov = np.cov(features, rowvar=False)
+                #         fid_re = calc_fid(sample_mean, sample_cov, real_mean, real_cov)
+                # with open(os.path.join(args.log_dir, 'log_fid.txt'), 'a+') as f:
+                #     f.write(f"{i:07d}; sample: {float(fid_sa):.4f}; rec_fake: {float(fid_sr):.4f}; rec_real: {float(fid_re):.4f};\n")
 
             if i % args.save_every == 0:
                 torch.save(
@@ -922,9 +924,9 @@ if __name__ == "__main__":
     )
 
     from idinvert_pytorch.models.perceptual_model import VGG16
-    vggnet = VGG16(output_layer_idx=args.output_layer_idx).to(device)
-    vgg_ckpt = torch.load(args.vgg_ckpt, map_location=lambda storage, loc: storage)
-    vggnet.load_state_dict(vgg_ckpt)
+    # vggnet = VGG16(output_layer_idx=args.output_layer_idx).to(device)
+    # vgg_ckpt = torch.load(args.vgg_ckpt, map_location=lambda storage, loc: storage)
+    # vggnet.load_state_dict(vgg_ckpt)
 
     if args.resume:
         if args.ckpt is None:
@@ -1035,5 +1037,5 @@ if __name__ == "__main__":
 
     train(
         args, loader, loader2, generator, encoder, discriminator, discriminator2,
-        vggnet, g_optim, e_optim, d_optim, d2_optim, g_ema, e_ema, device
+        g_optim, e_optim, d_optim, d2_optim, g_ema, e_ema, device
     )

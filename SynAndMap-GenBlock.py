@@ -1,3 +1,5 @@
+import pdb
+
 import torch
 from torch import nn
 from torchvision import utils
@@ -7,6 +9,7 @@ import copy
 with torch.no_grad():
     ckpt = "/common/users/sm2322/MS-Thesis/GAN-Thesis-Work-Remote/styleGAN2-AE-Ligong-Remote/trainedPts/aegan/168000.pt"
     ckpt = torch.load(ckpt, map_location=lambda storage, loc: storage)
+    pdb.set_trace()
     device = "cuda"
     generator = Generator(128, 512, 8, 2).to(device)
     generator.load_state_dict(ckpt["g_ema"])

@@ -54,8 +54,8 @@ class PPLSampler(torch.nn.Module):
         # Interpolate in W or Z.
         if self.space == 'w':
             w0, w1 = self.G.mapping(z=torch.cat([z0,z1]), c=torch.cat([c,c])).chunk(2)
-            wt0 = w0.lerp(w1, t.unsqueeze(1).unsqueeze(2))
-            wt1 = w0.lerp(w1, t.unsqueeze(1).unsqueeze(2) + self.epsilon)
+            wt0 = w0.lerp(w1, t.unsqueeze(1).unsqueeze(2)) # wt0 = w0+t
+            wt1 = w0.lerp(w1, t.unsqueeze(1).unsqueeze(2) + self.epsilon) #wt1=w0+t+e w0     w1
         else: # space == 'z'
             zt0 = slerp(z0, z1, t.unsqueeze(1))
             zt1 = slerp(z0, z1, t.unsqueeze(1) + self.epsilon)
@@ -87,7 +87,7 @@ class PPLSampler(torch.nn.Module):
 
         # Evaluate differential LPIPS.
         lpips_t0, lpips_t1 = self.vgg16(img, resize_images=False, return_lpips=True).chunk(2)
-        dist = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
+        dist = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2 ##ppl
         return dist
 
 #----------------------------------------------------------------------------

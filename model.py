@@ -451,7 +451,7 @@ class Generator(nn.Module):
                 )
             )
 
-        self.style = nn.Sequential(*layers)
+        self.style = nn.Sequential(*layers) #the mlp for z to w
 
         self.channels = {
             4: 512,
@@ -463,16 +463,17 @@ class Generator(nn.Module):
             256: 64 * channel_multiplier,
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
-        }
+        } #have the channel dimension going forward
 
-        self.input = ConstantInput(self.channels[4])
+        self.input = ConstantInput(self.channels[4]) #constant noise for all layers
+
         self.conv1 = StyledConv(
             self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
         )
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
 
-        self.log_size = int(math.log(size, 2))
-        self.num_layers = (self.log_size - 2) * 2 + 1
+        self.log_size = int(math.log(size, 2)) #log_size=7 for size=128
+        self.num_layers = (self.log_size - 2) * 2 + 1 #num_layers=12
 
         self.convs = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -486,13 +487,23 @@ class Generator(nn.Module):
             shape = [1, 1, 2 ** res, 2 ** res]
             self.noises.register_buffer(f"noise_{layer_idx}", torch.randn(*shape))
 
-        for i in range(3, self.log_size + 1):
-            out_channel = self.channels[2 ** i]
-
+        for i in range(3, self.log_size + 1): #log_size=7; so range(3,8) - 3,4,5,6,7
+            out_channel = self.channels[2 ** i] #iter1to5: 8, 16,32,64,128; 512,512,512,512,256
+            # {
+            #     4: 512,
+            #     8: 512,
+            #     16: 512,
+            #     32: 512,
+            #     64: 512,
+            #     128: 256,
+            #     256: 128,
+            #     512: 64,
+            #     1024: 32,
+            # }
             self.convs.append(
                 StyledConv(
                     in_channel,
-                    out_channel,
+                    out_channel, #iter1to5: 8, 16,32,64,128; 512,512,512,512,256
                     3,
                     style_dim,
                     upsample=True,
@@ -536,6 +547,7 @@ class Generator(nn.Module):
 
     def get_latent(self, input, detach=False):
         shape = input.shape
+        print("shahpe[-1] :",shape[-1])
         if shape[-1] > self.style_dim:
             style = self.style(input.view(-1, self.style_dim))
             style = style.view(*shape)
@@ -594,6 +606,7 @@ class Generator(nn.Module):
         randomize_noise=True,
         detach_style=False,
     ):
+        print("initial styles type is: ",type(styles))
         if not input_is_latent:  # if `style' is z, then get w = self.style(z)
             styles = [self.get_latent(s, detach=detach_style) for s in styles]
 
@@ -614,9 +627,12 @@ class Generator(nn.Module):
                 )
 
             styles = style_t
-
+        print("styles type is : ",type(styles))
+        print("styles len is: ",len(styles))
+        print("styles[0] is of shape",styles[0].shape)
+        print("styles[0].ndim is :",styles[0].ndim)
         if len(styles) < 2:  # no mixing
-            inject_index = self.n_latent
+            inject_index = self.n_latent #12 for size 128
 
             if styles[0].ndim < 3:  # w is of dim [batch, 512], repeat at dim 1 for each block
                 if styles[0].shape[1] == self.style_dim:
@@ -635,12 +651,15 @@ class Generator(nn.Module):
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
             latent = torch.cat([latent, latent2], 1)
+        print("latent type is :",latent.shape)
 
         out = self.input(latent)  # only batch_size of latent is used
+        print("out shape is :",out.shape)
         out = self.conv1(out, latent[:, 0], noise=noise[0])
 
         skip = self.to_rgb1(out, latent[:, 1])
-
+        print("what does self.convs contain?: ",self.convs)
+        print("what does self.rgbs contain?: ", self.to_rgbs)
         i = 1
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
@@ -648,10 +667,12 @@ class Generator(nn.Module):
             out = conv1(out, latent[:, i], noise=noise1)
             out = conv2(out, latent[:, i + 1], noise=noise2)
             skip = to_rgb(out, latent[:, i + 2], skip)
+            print("skip shape is : ",skip.shape)
 
             i += 2
 
         image = skip
+        print("image shape is :",image.shape)
 
         if return_latents:
             return image, latent
